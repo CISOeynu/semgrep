@@ -36,6 +36,7 @@ val hook_resolve_dependencies :
   (par_conf:Parallelism_config.t ->
   download_dependency_source_code:bool ->
   allow_local_builds:bool ->
+  gradle_module_attribution:bool ->
   package_manager_env:(string * string) list ->
   Out.dependency_source list ->
   (Out.dependency_source * Out.resolution_result) list)
@@ -54,4 +55,12 @@ val hook_match_subprojects : (Out.fpath list -> Out.subproject list) option ref
 
 val hook_run_symbol_analysis :
   (Out.symbol_analysis_params -> (Out.symbol_analysis, string) result) option
+  ref
+
+val hook_scan :
+  (par_conf:Parallelism_config.t ->
+  num_jobs:int ->
+  Out.scan_params ->
+  (Out.core_output, string) result)
+  option
   ref

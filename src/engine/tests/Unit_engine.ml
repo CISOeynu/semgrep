@@ -88,10 +88,10 @@ let full_lang_info =
     (Lang.Clojure, "clojure", ".clj");
     (Lang.Xml, "xml", ".xml");
     (Lang.Dart, "dart", ".dart");
-    (Lang.Ql, "ql", ".ql");
     (Lang.Move_on_sui, "move_on_sui", ".move");
     (Lang.Move_on_aptos, "move_on_aptos", ".move");
     (Lang.Fga, "fga", ".fga");
+    (Lang.Objc, "objc", ".m");
   ]
 
 (*****************************************************************************)
@@ -255,6 +255,8 @@ let language_exceptions =
     (Lang.Jsonnet, [ "dots_stmts"; "deep_exprstmt"; "dots_nested_stmts" ]);
     (* TODO *)
     (Lang.Clojure, [ "deep_exprstmt"; "dots_nested_stmts" ]);
+    (* good boy *)
+    (Lang.Dart, []);
   ]
 
 (* TODO: infer dir and ext from lang using Lang helper functions *)
@@ -302,6 +304,7 @@ let maturity_tests () =
       make_maturity_tests Lang.Ruby "ruby" ".rb" GA;
       make_maturity_tests Lang.Ts "ts" ".ts" GA;
       make_maturity_tests Lang.Scala "scala" ".scala" GA;
+      make_maturity_tests Lang.Dart "dart" ".dart" GA;
       (* Beta *)
       make_maturity_tests Lang.Hack "hack" ".hack" Beta;
       make_maturity_tests Lang.Kotlin "kotlin" ".kt" Beta;
@@ -327,7 +330,7 @@ let maturity_tests () =
       make_maturity_tests Lang.Jsonnet "jsonnet" ".jsonnet" Experimental;
       make_maturity_tests Lang.Clojure "clojure" ".clj" Experimental
       (* Not even experimental yet *)
-      (* HTML, XML, Dart *);
+      (* HTML, XML *);
     ]
 
 (*****************************************************************************)
@@ -609,6 +612,181 @@ let filter_irrelevant_rules_tests =
      |> List.map (fun target_file -> test_irrelevant_rule_file target_file))
 
 (*****************************************************************************)
+(* Regexp prefilter extraction tests *)
+(*****************************************************************************)
+
+(* Tests that we can extract literal string prefilters from regexes, which we
+   do for regex-only (LRegex) rules. See Prefiltering.Regexp_prefilter. *)
+let regexp_prefilter_tests =
+  let module F = Prefiltering.Formula in
+  let module P = Prefiltering.Predicate in
+  let check re (expected : P.t F.t option) =
+    t (spf "extract prefilter from /%s/" re) (fun () ->
+        let got = Prefiltering.Regexp_prefilter.required_substrings re in
+        let eq =
+          match (got, expected) with
+          | None, None -> true
+          | Some g, Some e -> F.equal P.equal g e
+          | Some _, None
+          | None, Some _ ->
+              false
+        in
+        if not eq then
+          let show = function
+            | None -> "None"
+            | Some f -> F.show P.pp f
+          in
+          Alcotest.failf "for /%s/: expected %s but got %s" re (show expected)
+            (show got))
+  in
+  let str s = F.pred (P.String { needle = s; case_sensitive = true }) in
+  let istr s = F.pred (P.String { needle = s; case_sensitive = false }) in
+  Testo.categorize "regexp prefilter extraction"
+    [
+      (* The motivating case: an AWS-style key. Any match must contain one of
+         the fixed prefixes, so we get a disjunction of literal substrings. *)
+      check {|(?<KEY>\b((AKIA|ABIA|ACCA)[0-9A-Z]{16})\b)|}
+        (F.or_ [ str "AKIA"; str "ABIA"; str "ACCA" ]);
+      (* Literals on both sides of a variable-length gap are both required. *)
+      check {|foo\d+bar|} (F.and_ [ str "foo"; str "bar" ]);
+      (* A plain (parenthesized) literal collapses to a single substring. *)
+      check {|(foobar)|} (Some (str "foobar"));
+      (* An alternation with an unconstrained branch (here [.]) yields no
+         useful condition, so we fall back to the full regex (None). *)
+      check {|foo|.|} None;
+      (* Runs shorter than the minimum useful length are dropped. *)
+      check {|a.b|} None;
+      (* Case-insensitive scope: literals become case-insensitive predicates. *)
+      check {|(?i:abuseipdb|key)|} (F.or_ [ istr "abuseipdb"; istr "key" ]);
+      check {|(?i)AKIA[0-9]{16}|} (Some (istr "AKIA"));
+      (* Mixed scope: a case-insensitive run and a case-sensitive run are kept
+         separate, never merged. *)
+      check {|(?i:foo)BARBAZ|} (F.and_ [ istr "foo"; str "BARBAZ" ]);
+      (* Soundness guard: [Parser_regexp] mis-parses a bracket expression
+         containing whitespace (here [ =:]) into literal characters, which do
+         not reflect PCRE semantics; we must not extract from it. *)
+      check {|prefix[ =:]+suffix|} None;
+      (* A fixed repeat count is expanded into the full literal. *)
+      check {|(ab){3}|} (Some (str "ababab"));
+      (* ... and merges with its neighbors, up to the expansion cap (8). *)
+      check {|d(ab){8}c|} (Some (str "dababababababababc"));
+      (* Soundness guard: a repeat count above the expansion cap (8) is
+         materialized with only 8 copies, so the result must be claimed as a
+         prefix and a suffix rather than the exact match; requiring e.g.
+         "d(ab)^8c" as one contiguous substring would wrongly skip files
+         matching d(ab){10}c. *)
+      check {|d(ab){10}c|}
+        (F.and_ [ str "dabababababababab"; str "ababababababababc" ]);
+      (* When the prefix and suffix runs coincide, require them only once. *)
+      check {|(ab){9}|} (Some (str "abababababababab"));
+      (* A (?i) directive applies to all following alternation branches. *)
+      check {|(?i)foo|bar|} (F.or_ [ istr "foo"; istr "bar" ]);
+      (* A mid-sequence (?i) does not parse ([Parser_regexp] only supports
+         directives where PCRE scoping is unambiguous), so we extract
+         nothing rather than risk wrong case-sensitivity. *)
+      check {|abc(?i)def|} None;
+      (* Escaped punctuation is a literal... *)
+      check {|foo\.bar|} (Some (str "foo.bar"));
+      (* A trailing literal '-' in a character class must not derail the
+         literals around it (a lexer bug used to make the class swallow the
+         rest of the pattern, losing ".auth0.com" here). *)
+      check {|(?<DOMAIN>([a-zA-Z0-9][a-zA-Z0-9._-]*\.auth0\.com))|}
+        (Some (str ".auth0.com"));
+      (* ... but escapes the lexer decodes as letters or to the wrong byte
+         (here \N, which in PCRE matches any non-newline character, and \cI,
+         a control character) must not become required literals. *)
+      check {|abc\Ndef|} (F.and_ [ str "abc"; str "def" ]);
+      check {|abc\cIdef|} (F.and_ [ str "abc"; str "def" ]);
+    ]
+
+let utf8_regex_prefilter_tests =
+  let module P = Prefiltering.Predicate in
+  let predicate = P.Regex (Pcre2_.compile_exn "TOKEN") in
+  Testo.categorize "UTF-8 regex prefilter"
+    [
+      t "valid content can skip repeated UTF-8 checks" (fun () ->
+          let content = "TOKEN ☃" in
+          let utf8_valid = lazy_safe (String.is_valid_utf_8 content) in
+          Alcotest.(check bool) "valid UTF-8" true (Lazy_safe.force utf8_valid);
+          Alcotest.(check bool)
+            "match" true
+            (P.eval ~utf8_valid predicate content));
+      t "invalid content retains conservative error handling" (fun () ->
+          let content = "TOKEN \xff" in
+          let utf8_valid = lazy_safe (String.is_valid_utf_8 content) in
+          Alcotest.(check bool)
+            "invalid UTF-8" false
+            (Lazy_safe.force utf8_valid);
+          Alcotest.(check bool)
+            "allow rule on PCRE2 error" true
+            (P.eval ~utf8_valid predicate content));
+      t "known invalid content has no regex matches" (fun () ->
+          let content = "TOKEN \xff" in
+          let regex = Pcre2_.compile_exn "TOKEN" in
+          let matches =
+            Xpattern_match_regexp.regexp_matcher ~utf8_valid:false content
+              (Fpath.v "unused") regex
+          in
+          Alcotest.(check int) "matches" 0 (List.length matches));
+    ]
+
+let file_prefilter_memo_tests =
+  let module F = Prefiltering.Formula in
+  let module P = Prefiltering.Predicate in
+  Testo.categorize "file prefilter memoization"
+    [
+      t "caller-supplied regexes retain their compile options" (fun () ->
+          let make options =
+            let re = Pcre2_.compile_exn ~options "token" in
+            Prefiltering.File.of_formula (F.pred (P.Regex re))
+          in
+          let sensitive = make [] in
+          let caseless = make [ `CASELESS ] in
+          let results =
+            Prefiltering.File.check_many [ sensitive; caseless ] "TOKEN"
+          in
+          Alcotest.(check (list bool))
+            "different results" [ false; true ] results);
+    ]
+
+(*****************************************************************************)
+(* Prefilter conjunct ranking tests *)
+(*****************************************************************************)
+
+(* Tests that [Formula.sort_by_cost] reorders And/Or children so that cheap
+   (string) predicates are evaluated before expensive (regex) ones, stably. *)
+let prefilter_ranking_tests =
+  let module F = Prefiltering.Formula in
+  let module P = Prefiltering.Predicate in
+  let str s = F.pred (P.String { needle = s; case_sensitive = true }) in
+  let re s = F.pred (P.Regex (Pcre2_.compile_exn ~options:[ `MULTILINE ] s)) in
+  let and_ xs = Option.get (F.and_ xs) in
+  let or_ xs = Option.get (F.or_ xs) in
+  let check name formula expected =
+    t name (fun () ->
+        let got = F.sort_by_cost ~cost:P.eval_cost formula in
+        if not (F.equal P.equal got expected) then
+          Alcotest.failf "expected %s but got %s" (F.show P.pp expected)
+            (F.show P.pp got))
+  in
+  Testo.categorize "prefilter conjunct ranking"
+    [
+      (* Strings are cheaper than regexes, so they move to the front. *)
+      check "regex after string"
+        (and_ [ re "a.*b"; str "foo" ])
+        (and_ [ str "foo"; re "a.*b" ]);
+      (* The sort is stable: same-cost predicates keep their order. *)
+      check "stable within cost tiers"
+        (and_ [ str "a"; re "x+"; str "b"; re "y+" ])
+        (and_ [ str "a"; str "b"; re "x+"; re "y+" ]);
+      (* Subtrees rank by their most expensive predicate, and nested And/Or
+         are sorted too. *)
+      check "nested subtrees"
+        (or_ [ and_ [ re "p.*q"; str "bar" ]; str "baz" ])
+        (or_ [ str "baz"; and_ [ str "bar"; re "p.*q" ] ]);
+    ]
+
+(*****************************************************************************)
 (* Tainting tests *)
 (*****************************************************************************)
 
@@ -645,6 +823,7 @@ let tainting_test (lang : Lang.t) (rules_file : Fpath.t) (file : Fpath.t) =
   let matches =
     taint_rules
     |> List.concat_map (fun rule ->
+        let lazy_content = lazy_safe (UFile.read_file file) in
         let xtarget : Xtarget.t =
           {
             path =
@@ -653,7 +832,8 @@ let tainting_test (lang : Lang.t) (rules_file : Fpath.t) (file : Fpath.t) =
                 internal_path_to_content = file;
               };
             analyzer = Analyzer.L (lang, []);
-            lazy_content = lazy_safe (UFile.read_file file);
+            lazy_content;
+            lazy_utf8_valid = Lazy_safe.map String.is_valid_utf_8 lazy_content;
             lazy_ast_and_errors = lazy_safe (ast, []);
           }
         in
@@ -822,7 +1002,15 @@ let full_rule_taint_maturity_tests =
  *)
 let semgrep_rules_repo_tests : Testo.t list =
   let path = tests_path / "semgrep-rules" in
-  let tests = Test_engine.make_tests [ path ] in
+  let expectations_file = tests_path / "rule-expectations.json" in
+  let expectations =
+    if Sys_.file_exists (Fpath.to_string expectations_file) then
+      match Test_expectations.load expectations_file with
+      | Ok expectations -> expectations
+      | Error (`Msg message) -> failwith message
+    else Test_expectations.empty
+  in
+  let tests = Test_engine.make_tests ~expectations [ path ] in
   let groups =
     tests
     |> List.filter_map (fun (test : Testo.t) ->
@@ -904,6 +1092,80 @@ let semgrep_rules_repo_tests : Testo.t list =
 (* All tests *)
 (*****************************************************************************)
 
+let external_expectations_tests =
+  let run ~source ~engine ~path ~lines ~passes () =
+    let module F = Testutil_files in
+    let rules =
+      {|rules:
+  - id: first
+    languages: [python]
+    message: first
+    severity: WARNING
+    pattern: danger(...)
+  - id: second
+    languages: [python]
+    message: second
+    severity: WARNING
+    pattern: sink(...)
+|}
+    in
+    let overrides =
+      Printf.sprintf {|[{"path":%S,"rule_id":"first","engine":%S,"lines":%s}]|}
+        path engine lines
+    in
+    F.with_tempfiles ~chdir:true
+      [
+        F.Dir
+          ("rules", [ F.File ("test.yaml", rules); F.File ("test.py", source) ]);
+        F.Dir ("expectations", [ F.File ("overrides.json", overrides) ]);
+      ]
+      (fun _ ->
+        let expectations =
+          match
+            Test_expectations.load (Fpath.v "expectations/overrides.json")
+          with
+          | Ok expectations -> expectations
+          | Error (`Msg message) -> failwith message
+        in
+        let tests =
+          Test_engine.make_tests ~expectations
+            ~fail_callback:(fun _ message -> failwith message)
+            [ Fpath.v "rules" ]
+        in
+        let passed =
+          try
+            List.iter (fun (test : Testo.t) -> test.func ()) tests;
+            true
+          with
+          | Failure _ -> false
+        in
+        Alcotest.(check bool) "rule expectations" passes passed)
+  in
+  let baseline = "# ruleid: first\ndanger()\n# ruleid: second\nsink()\n" in
+  let changed =
+    "# ruleid: first\nsafe()\ndanger()\n# ruleid: second\nsink()\n"
+  in
+  let removed = "# ruleid: first\nsafe()\n# ruleid: second\nsink()\n" in
+  let test name ?(source = changed) ?(engine = "OSS")
+      ?(path = "../rules/test.py") ~lines ~passes () =
+    t name (run ~source ~engine ~path ~lines ~passes)
+  in
+  Testo.categorize "external rule expectations"
+    [
+      test "changed findings" ~lines:"[3]" ~passes:true ();
+      test "removed findings" ~source:removed ~lines:"[]" ~passes:true ();
+      test "wrong findings fail" ~lines:"[2]" ~passes:false ();
+      test "rule IDs remain isolated"
+        ~source:"# ruleid: second\ndanger(sink())\n" ~lines:"[]" ~passes:false
+        ();
+      test "other rules still fail" ~source:"# ruleid: second\nsafe()\n"
+        ~lines:"[]" ~passes:false ();
+      test "engines remain isolated" ~source:baseline ~engine:"Pro" ~lines:"[]"
+        ~passes:true ();
+      test "targets remain isolated" ~source:baseline ~path:"../rules/other.py"
+        ~lines:"[]" ~passes:true ();
+    ]
+
 let tests =
   List_.flatten
     [
@@ -912,9 +1174,14 @@ let tests =
       lang_autofix_tests ~polyglot_pattern_path;
       eval_regression_tests ();
       filter_irrelevant_rules_tests;
+      regexp_prefilter_tests;
+      utf8_regex_prefilter_tests;
+      file_prefilter_memo_tests;
+      prefilter_ranking_tests;
       lang_tainting_tests ();
       maturity_tests ();
       full_rule_taint_maturity_tests;
       full_rule_regression_tests;
       semgrep_rules_repo_tests;
+      external_expectations_tests;
     ]

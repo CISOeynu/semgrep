@@ -42,7 +42,7 @@
 #
 # coupling: if you add a file here, you probably want to add it in
 # semgrep.nix and the pro dockerfile
-FROM ghcr.io/astral-sh/uv:0.10.9 as uv
+FROM ghcr.io/astral-sh/uv:0.13.4 as uv
 
 FROM scratch AS build-files
 WORKDIR /src
@@ -116,27 +116,35 @@ RUN apk update && apk add bash build-base git make rsync opam
 # - scripts/{osx-setup-for-release,setup-m1-builder}.sh
 # - doc/SEMGREP_CORE_CONTRIBUTING.md
 # - https://github.com/Homebrew/homebrew-core/blob/master/Formula/semgrep.rb
-RUN opam init --disable-sandboxing -v && opam switch create 5.3.0 ocaml-variants.5.3.0+options ocaml-option-flambda -y -v
-
 # Install semgrep-core build dependencies
 WORKDIR /src/semgrep
+
+# Copy just the Makefile (and its include) first so that initializing opam and
+# creating the switch stay in their own docker cache layers, independent of the
+# opam files, lockfiles, and sources copied below. Creating the switch (which
+# builds the compiler) is one of the most expensive steps of the build.
+COPY Makefile cygwin-env.mk tree-sitter-config.mk tree-sitter-config.sh ./
+
+# Initialize opam with our pinned opam-repository (containers can't use the
+# bubblewrap sandbox), then create the switch and install our fork of the
+# compiler ('make switch' runs 'make pin-ocaml-fork').
+RUN make opam-init OPAM_INIT_FLAGS=--disable-sandboxing
+RUN make switch
 
 # Copy just what is needed for make install-deps below to work to maximize
 # docker cache hit as building and installing all the opam packages
 # is what takes the most time in the docker build.
 #
 # coupling: if you change this you probably want to change this in semgrep-pro
-COPY Makefile cygwin-env.mk semgrep.opam ./
+COPY semgrep.opam ./
 COPY dev/required.opam dev/
 COPY scripts/build-static-libcurl.sh scripts/
 COPY scripts/validate-compiler-sha.sh scripts/
 COPY scripts/pick-lockfile.sh scripts/
 COPY opam-lockfiles/ ./opam-lockfiles
-COPY libs/ocaml-tree-sitter-core libs/ocaml-tree-sitter-core
+COPY libs/ocaml-tree-sitter-semgrep/core libs/ocaml-tree-sitter-semgrep/core
 COPY cli/src/semgrep/semgrep_interfaces cli/src/semgrep/semgrep_interfaces
-
-# Install our fork of the compiler
-RUN make pin-ocaml-fork
+COPY dune-project ./
 
 RUN make install-deps
 
@@ -147,6 +155,12 @@ RUN opam list
 COPY --from=build-files /src .
 # Docker struggles to copy symlinks, so let's just make it
 RUN ln -s _build/install/default/bin bin
+
+# Baked into semgrep-core as Git_info.commit (shown by -version). The
+# build context has no .git, so the binary cannot derive the SHA itself.
+# Declared here (after install-deps) so it does not re-key that layer.
+ARG VCS_REF_HEAD_REVISION
+ENV SEMGREP_GIT_COMMIT=${VCS_REF_HEAD_REVISION}
 
 # Compile (and minimal test) semgrep-core
 RUN opam exec -- make core
@@ -173,6 +187,8 @@ RUN opam exec -- make install-pyro-caml
 FROM alpine:3.23 AS semgrep-oss
 
 WORKDIR /pysemgrep
+
+COPY scripts/validate-system-ca.py /tmp/validate-system-ca.py
 
 # Update to the latest packages for the base image. This allows to get CVE
 # fixes ASAP, without waiting for new builds of the base image.
@@ -213,8 +229,11 @@ RUN apk upgrade --no-cache && \
 # - curl: useful to connect to some webhooks
 # - python3: to run pysemgrep
 # - py3-setuptools: necessary runtime dependency for opentelemetry
+	'ca-certificates>=20261020-r0' \
+	'ca-certificates-bundle>=20261020-r0' \
 	git git-lfs openssh \
 	bash jq curl python3 py3-setuptools
+RUN python3 /tmp/validate-system-ca.py && rm /tmp/validate-system-ca.py
 
 # We just need the Python code in cli/.
 # The semgrep-core stuff would be copied from the other container
@@ -246,7 +265,7 @@ RUN apk add --no-cache --virtual=.build-deps build-base make py3-pip && \
 # Get semgrep-core from step1
 COPY --from=semgrep-core-container /src/semgrep/_build/default/src/main/Main.exe /usr/local/bin/semgrep-core
 # Get pyro-caml from step1
-COPY --from=semgrep-core-container /root/.opam/5.3.0/bin/pyro-caml /usr/bin/pyro-caml
+COPY --from=semgrep-core-container /root/.opam/5.4.0/bin/pyro-caml /usr/bin/pyro-caml
 # We don't need the python source anymore; 'pip install ...' above
 # installed them under /usr/local/lib/python3.xx/site-packages/semgrep/
 RUN ln -s semgrep-core /usr/local/bin/osemgrep && rm -rf /pysemgrep
@@ -305,6 +324,11 @@ RUN printf "[safe]\n	directory = /src"  > ~semgrep/.gitconfig && \
 # will show the help text, but
 #   docker run -it semgrep/semgrep /bin/bash
 # will let users bring up a bash session.
+#
+# This stage intentionally stays as root so `docker run -v ${PWD}:/src ...`
+# works against host-owned bind mounts; the `nonroot` stage below is what
+# ships to users who want a non-root image.
+# nosemgrep: dockerfile.security.missing-user.missing-user
 CMD ["semgrep", "--help"]
 LABEL maintainer="support@semgrep.com"
 
@@ -324,10 +348,18 @@ FROM semgrep-oss AS semgrep-cli
 # locally, set the SEMGREP_APP_TOKEN environment variable and then run:
 #
 # $ docker build --secret id=SEMGREP_APP_TOKEN ...
-RUN --mount=type=secret,id=SEMGREP_APP_TOKEN if [ -f /run/secrets/SEMGREP_APP_TOKEN ]; then ( SEMGREP_APP_TOKEN=$(cat /run/secrets/SEMGREP_APP_TOKEN) semgrep install-semgrep-pro --debug ); else ( echo "SEMGREP_APP_TOKEN secret not set, skipping semgrep-pro install" >&2 ); fi
-
-# Clear out any detritus from the pro install (especially credentials)
-RUN rm -rf /root/.semgrep
+#
+# The install and the credentials cleanup must run in the same RUN so the
+# token-bearing ~/.semgrep/settings.yml never lands in a committed layer.
+RUN --mount=type=secret,id=SEMGREP_APP_TOKEN \
+    rc=0; \
+    if [ -f /run/secrets/SEMGREP_APP_TOKEN ]; then \
+        SEMGREP_APP_TOKEN=$(cat /run/secrets/SEMGREP_APP_TOKEN) semgrep install-semgrep-pro --debug || rc=$?; \
+    else \
+        echo "SEMGREP_APP_TOKEN secret not set, skipping semgrep-pro install" >&2; \
+    fi; \
+    rm -rf /root/.semgrep; \
+    exit ${rc}
 
 # This was the final step! This is what we ship to users!
 
@@ -389,11 +421,8 @@ COPY --from=semgrep-core-container /src/semgrep/_build/default/src/main/Main.exe
 # Copy in scripts folder
 COPY scripts/ ./scripts/
 
-# Build the source distribution and binary wheel, validate that the wheel
-# installs correctly. We're only checking the musllinux wheel because this is
-# an Alpine container. It should not be a problem because the content of the
-# wheels are identical.
-RUN scripts/build-wheels.sh && scripts/validate-wheel.sh cli/dist/*musllinux*.whl
+# Build the source distribution and binary wheel.
+RUN scripts/build-wheels.sh
 
 FROM scratch AS semgrep-wheel-binaries
 

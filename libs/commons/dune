@@ -2,6 +2,7 @@
  (public_name commons)
  (wrapped false)
  (libraries
+   base
    collections
    ; stdlib
    str
@@ -23,7 +24,6 @@
    cmdliner
    bos
    re
-   pcre
    pcre2
    digestif.ocaml
    sexplib

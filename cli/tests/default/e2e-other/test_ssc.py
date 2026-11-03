@@ -31,6 +31,7 @@ from semdep.parsers.util import DependencyParser
 from semdep.parsers.yarn import parse_yarn
 from semgrep.semgrep_interfaces.semgrep_output_v1 import Ecosystem
 from semgrep.semgrep_interfaces.semgrep_output_v1 import Maven
+from semgrep.util import IS_WINDOWS
 
 pytestmark = pytest.mark.kinda_slow
 
@@ -245,6 +246,14 @@ pytestmark = pytest.mark.kinda_slow
             "rules/dependency_aware/swift-sca.yaml",
             "dependency_aware/swiftpm_missing_version",
         ),
+        # In the analysis table, check that basic/malicious are distinguished
+        # Two SCA rules on one target -- one "Basic" (upgrade-only) and one
+        # "Malicious" -- to exercise the SCA analysis-type labels in the plan
+        # table (see table_by_sca_analysis() in core_targets_plan.py).
+        (
+            "rules/dependency_aware/basic-and-malicious.yaml",
+            "dependency_aware/basic_and_malicious",
+        ),
     ],
 )
 @pytest.mark.osemfail
@@ -394,6 +403,10 @@ def test_ssc__requirements_lockfiles(
             "dependency_aware/gradle-no-lockfile",
         ),
         (
+            "rules/dependency_aware/gradle-guava.yaml",
+            "dependency_aware/gradle-multi-module-duplicate",
+        ),
+        (
             "rules/dependency_aware/java-gradle-sca.yaml",
             "dependency_aware/gradle-no-lockfile-missing-gradlew",
         ),
@@ -431,6 +444,232 @@ def test_ssc__lockfileless(
         result.as_snapshot(),
         "results.txt",
     )
+
+
+@pytest.mark.requires_lockfileless_deps
+@pytest.mark.parametrize("enabled", [False, True])
+def test_gradle_module_attribution_rollout(
+    run_semgrep_on_copied_files: RunSemgrep, enabled: bool
+):
+    """Opting in changes module finding paths and IDs; default retains the old ID."""
+    target = "dependency_aware/gradle-multi-module-duplicate"
+    options = ["--allow-local-builds"]
+    if enabled:
+        options.append("--x-gradle-module-attribution")
+    result = run_semgrep_on_copied_files(
+        "rules/dependency_aware/gradle-guava.yaml",
+        target_name=target,
+        options=options,
+        clean_fingerprint=False,
+        is_logged_in_weak=True,
+    )
+    output = json.loads(result.raw_stdout)
+    assert output["errors"] == []
+    findings = output["results"]
+    prefix = f"targets/{target}/"
+    root_manifest = prefix + "settings.gradle.kts"
+    # Captured from the CLI before module attribution was introduced.
+    legacy_mid = (
+        "19710a660200bf3e155336d6c0ccc1ead9626764ae6043f1af4524ccac74ac69"
+        "fcf2fba9b534805eda952b1df016996f87bfcdb724ad16d08e4f66e7e212210d_0"
+    )
+    if IS_WINDOWS:
+        # MIDs include the platform-specific Path representation.
+        legacy_mid = (
+            "9f9f9bcd7e0cc684216f0337ddd740ebb38c65cd1f25b8a241771acc723498b213"
+            "53b68fef82ca3148b635a559761206a12062056f4f2e9ead28a87da5f10e45_0"
+        )
+    expected_paths = (
+        {prefix + "app/build.gradle.kts", prefix + "lib/build.gradle.kts"}
+        if enabled
+        else {root_manifest}
+    )
+    assert len(findings) == len(expected_paths)
+    assert {Path(finding["path"]).as_posix() for finding in findings} == expected_paths
+    mids = {finding["extra"]["fingerprint"] for finding in findings}
+    if enabled:
+        assert len(mids) == 2
+        assert legacy_mid not in mids
+    else:
+        assert mids == {legacy_mid}
+    for finding in findings:
+        dependency = finding["extra"]["sca_info"]["dependency_match"][
+            "found_dependency"
+        ]
+        assert dependency["package"] == "com.google.guava:guava"
+        assert dependency["version"] == "32.1.1-jre"
+        assert Path(dependency["manifest_path"]).as_posix() == root_manifest
+        assert dependency["lockfile_path"] == finding["path"]
+        module = (
+            "app"
+            if Path(finding["path"]).as_posix().endswith("app/build.gradle.kts")
+            else "lib"
+        )
+        assert dependency["transitivity"] == (
+            "transitive" if enabled and module == "app" else "direct"
+        )
+        expected_children = (
+            {f"com.example:{module}-child"}
+            if enabled
+            else {"com.example:app-child", "com.example:lib-child"}
+        )
+        assert {
+            child["package"] for child in dependency["children"]
+        } == expected_children
+
+
+def _sca_associations(result: Any) -> list[tuple[str, bool, str, str, str]]:
+    """
+    Summarize each SCA finding as (finding path, reachable, dependency path,
+    transitivity, fingerprint). Paths are relative to the fixture directory.
+    Reads the unmasked JSON so the fingerprints (MIDs) can be checked.
+    """
+    output = json.loads(result.raw_stdout)
+    assert output["errors"] == []
+    associations = []
+    for finding in output["results"]:
+        sca_info = finding["extra"]["sca_info"]
+        found_dependency = sca_info["dependency_match"]["found_dependency"]
+        associations.append(
+            (
+                finding["path"],
+                sca_info["reachable"],
+                found_dependency["lockfile_path"],
+                found_dependency["transitivity"],
+                finding["extra"]["fingerprint"],
+            )
+        )
+    return sorted(associations)
+
+
+GRADLE_GUAVA_RULE = "rules/dependency_aware/gradle-guava.yaml"
+GRADLE_MODULE_REACHABLE_TARGETS = "targets/dependency_aware/"
+
+
+@pytest.mark.parametrize(
+    "target,expected",
+    [
+        # Guava is transitive in app and direct in lib. The app code must pair
+        # with app's own copy; lib's direct copy is a dependency-only finding.
+        (
+            "gradle-module-reachable-mixed",
+            [
+                (
+                    "app/src/main/java/App.java",
+                    True,
+                    "app/build.gradle.kts",
+                    "transitive",
+                ),
+                ("lib/build.gradle.kts", False, "lib/build.gradle.kts", "direct"),
+            ],
+        ),
+        # Both modules depend on Guava directly. Only app has matching code, so
+        # there is exactly one reachable finding, and lib keeps its own
+        # dependency-only finding.
+        (
+            "gradle-module-reachable-both-direct",
+            [
+                ("app/src/main/java/App.java", True, "app/build.gradle.kts", "direct"),
+                ("lib/build.gradle.kts", False, "lib/build.gradle.kts", "direct"),
+            ],
+        ),
+        # Root, nested, and empty modules, plus an explicit project dependency:
+        # - code in the root module pairs with the root build file,
+        # - code in services/api pairs with that nested module,
+        # - code in empty (no resolved dependencies) gets no finding, so root
+        #   dependencies do not leak into it,
+        # - app depends on project(":lib") and has no Guava of its own, so its
+        #   code pairs with lib's Guava.
+        (
+            "gradle-module-reachable-layout",
+            [
+                ("app/src/main/java/App.java", True, "lib/build.gradle.kts", "direct"),
+                (
+                    "services/api/src/main/java/Api.java",
+                    True,
+                    "services/api/build.gradle.kts",
+                    "direct",
+                ),
+                ("src/main/java/Root.java", True, "build.gradle.kts", "direct"),
+            ],
+        ),
+    ],
+)
+@pytest.mark.requires_lockfileless_deps
+def test_ssc__gradle_module_reachable_attribution(
+    run_semgrep_on_copied_files: RunSemgrep,
+    target: str,
+    expected: list[tuple[str, bool, str, str]],
+):
+    """
+    With Gradle module attribution enabled, a reachable code match must only be
+    paired with dependencies applicable to the module that contains the code.
+    """
+    result = run_semgrep_on_copied_files(
+        GRADLE_GUAVA_RULE,
+        target_name=f"dependency_aware/{target}",
+        options=["--allow-local-builds", "--x-gradle-module-attribution"],
+        is_logged_in_weak=True,
+    )
+    prefix = f"{GRADLE_MODULE_REACHABLE_TARGETS}{target}/"
+    associations = _sca_associations(result)
+    assert [
+        (path.removeprefix(prefix), reachable, dependency.removeprefix(prefix), kind)
+        for path, reachable, dependency, kind, _ in associations
+    ] == expected
+    fingerprints = [fingerprint for *_, fingerprint in associations]
+    assert len(set(fingerprints)) == len(fingerprints), "duplicate finding IDs"
+    # One finding per (code, rule): the first index of the match-based ID
+    assert all(fingerprint.endswith("_0") for fingerprint in fingerprints)
+
+
+@pytest.mark.parametrize(
+    "target,reachable_paths",
+    [
+        ("gradle-module-reachable-mixed", ["app/src/main/java/App.java"]),
+        ("gradle-module-reachable-both-direct", ["app/src/main/java/App.java"]),
+        (
+            "gradle-module-reachable-layout",
+            [
+                "app/src/main/java/App.java",
+                "empty/src/main/java/Empty.java",
+                "services/api/src/main/java/Api.java",
+                "src/main/java/Root.java",
+            ],
+        ),
+    ],
+)
+@pytest.mark.requires_lockfileless_deps
+def test_ssc__gradle_module_reachable_attribution_flag_off(
+    run_semgrep_on_copied_files: RunSemgrep,
+    target: str,
+    reachable_paths: list[str],
+):
+    """
+    Without the flag, the whole Gradle build stays one unit: every code match
+    pairs with the single package-level Guava entry reported at the root
+    manifest, and the finding IDs are unchanged from before module scoping.
+    """
+    result = run_semgrep_on_copied_files(
+        GRADLE_GUAVA_RULE,
+        target_name=f"dependency_aware/{target}",
+        options=["--allow-local-builds"],
+        is_logged_in_weak=True,
+    )
+    prefix = f"{GRADLE_MODULE_REACHABLE_TARGETS}{target}/"
+    root_manifest = (
+        "build.gradle.kts"
+        if target == "gradle-module-reachable-layout"
+        else "settings.gradle.kts"
+    )
+    associations = _sca_associations(result)
+    assert [
+        (path.removeprefix(prefix), reachable, dependency.removeprefix(prefix), kind)
+        for path, reachable, dependency, kind, _ in associations
+    ] == [(path, True, root_manifest, "direct") for path in reachable_paths]
+    fingerprints = [fingerprint for *_, fingerprint in associations]
+    assert len(set(fingerprints)) == len(fingerprints), "duplicate finding IDs"
+    assert all(fingerprint.endswith("_0") for fingerprint in fingerprints)
 
 
 @pytest.mark.parametrize(
@@ -554,6 +793,8 @@ LOCKFILE_NAME_TO_PARSER: Dict[str, DependencyParser] = {
         "targets/dependency_aware/osv_parsing/yarn/empty.v2/yarn.lock",
         "targets/dependency_aware/osv_parsing/yarn/cache-compressionlevel.v2/yarn.lock",
         "targets/dependency_aware/osv_parsing/yarn/multiple-constraints.v1/yarn.lock",
+        # Generated by yarn 0.16.1, which omits the blank line after the header.
+        "targets/dependency_aware/osv_parsing/yarn/legacy-header.v1/yarn.lock",
         # SC-3479: Yarn Berry uses YAML's explicit-key form (`? "..."`) for
         # entries whose comma-joined descriptor list is too long to fit inline;
         # common with `patch:` protocol packages.
@@ -590,6 +831,7 @@ LOCKFILE_NAME_TO_PARSER: Dict[str, DependencyParser] = {
         "targets/dependency_aware/go/go.mod",
         "targets/dependency_aware/go_multi_newline/go.mod",
         "targets/dependency_aware/go_toolchain/go.mod",
+        "targets/dependency_aware/go_godebug/go.mod",
         "targets/dependency_aware/osv_parsing/go/parens-in-comments/go.mod",
     ],
 )
@@ -641,14 +883,6 @@ def test_parsing(caplog, target: str, snapshot, lockfile_path_in_tmp):
         assert len(error) == 1
     elif target.endswith("requirements/only-comments/requirements.txt"):
         assert len(error) == 1
-    elif target.endswith("requirements/one-package-unconstrained/requirements.txt"):
-        assert len(error) == 1
-    elif target.endswith("requirements/multiple-packages-mixed/requirements.txt"):
-        assert len(error) == 5
-    elif target.endswith("requirements/file-format-example/requirements.txt"):
-        assert len(error) == 10
-    elif target.endswith("requirements/bare-then-pinned/requirements.txt"):
-        assert len(error) == 8
     else:
         assert len(error) == 0
     assert len(caplog.records) == 0

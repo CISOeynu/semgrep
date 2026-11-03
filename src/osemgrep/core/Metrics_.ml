@@ -176,6 +176,7 @@ let default_payload =
         isAuthenticated = false;
         integrationName = None;
         deployment_id = None;
+        installMethod = None;
       };
     performance =
       {
@@ -242,6 +243,30 @@ let default_payload =
         oauth_name = None;
         oauth_email = None;
       };
+    guardian =
+      {
+        hook = None;
+        session_id = None;
+        login_method = None;
+        scanner_version = None;
+        guardian_version = None;
+        deployment_names = None;
+        deployment_ids = None;
+        organization_ids = None;
+        oauth_id = None;
+        oauth_email = None;
+        tool_name = None;
+        package_manager = None;
+        attached_lockfile = None;
+        num_scanned_files = None;
+        num_lines = None;
+        num_findings = None;
+        findings = None;
+        blocking = None;
+        exit_code = None;
+        errors = None;
+      };
+    install_pro = { success = None; error = None };
   }
 
 let default () =
@@ -474,21 +499,21 @@ let add_rules_hashes_and_findings_count (filtered_matches : (Rule.t * int) list)
 let add_targets_stats (targets : Fpath.t Set_.t)
     (prof_opt : Core_profiling.t option) =
   let targets = Set_.elements targets in
-  let hprof : (Fpath.t, Core_profiling.file_profiling) Hashtbl.t =
+  let hprof : (Fpath.t, Core_profiling.file_profiling) Base.Hashtbl.t =
     match prof_opt with
-    | None -> Hashtbl.create 0
+    | None -> Base.Hashtbl.Poly.create ()
     | Some (prof : Core_profiling.t) ->
         prof.file_times
         |> List.map (fun ({ Core_profiling.file; _ } as file_prof) ->
             (file, file_prof))
-        |> Hashtbl_.hash_of_list
+        |> Hashtbl_.Base.hash_of_list
   in
 
   let file_stats =
     targets
     |> List.filter_map (fun path ->
         let runTime, parseTime, matchTime =
-          match Hashtbl.find_opt hprof path with
+          match Base.Hashtbl.find hprof path with
           | Some (fprof : Core_profiling.file_profiling) ->
               ( Some fprof.run_time,
                 fprof.rule_times
@@ -509,7 +534,7 @@ let add_targets_stats (targets : Fpath.t Set_.t)
               {
                 Semgrep_metrics_t.size;
                 numTimesScanned =
-                  (match Hashtbl.find_opt hprof path with
+                  (match Base.Hashtbl.find hprof path with
                   | None -> 0
                   | Some fprof -> Option.map List.length fprof.rule_times ||| 0);
                 parseTime;

@@ -61,21 +61,17 @@ endif
 
 -include cygwin-env.mk
 
+# On macOS we point lwt's discover (and flags.sh's static linking) at the
+# brew-installed libraries via LIBRARY_PATH=$(HOMEBREW_PREFIX)/lib. GitHub-hosted
+# macOS runners export HOMEBREW_PREFIX in the environment, but some other runners
+# (e.g. Depot's macOS images) do not.
+ifeq ($(shell uname -s),Darwin)
+  HOMEBREW_PREFIX ?= $(shell brew --prefix 2>/dev/null)
+endif
+
 ###############################################################################
 # Build (and clean) targets
 ###############################################################################
-
-# Set environment variables used by dune files to locate the
-# C headers and libraries of the tree-sitter runtime library.
-# This file is created by ocaml-tree-sitter-core's configure script.
-#
-# Because of these required environment variables, we can't call dune directly
-# to build semgrep-core, unless you manually execute first
-#  `source src/ocaml-tree-sitter-core/tree-sitter-config.sh`
-#
-# I use '-include' and not 'include' because before 'make setup' this file does
-# not exist but we still want 'make setup' to succeed
--include libs/ocaml-tree-sitter-core/tree-sitter-config.mk
 
 # First (and default) target.
 .PHONY: default
@@ -97,13 +93,25 @@ copy-core-for-cli:
 	rm -f cli/src/semgrep/bin/semgrep-core$(EXE)
 	cp bin/semgrep-core$(EXE) cli/src/semgrep/bin/
 
+# Per-language grammar C stubs need TREESITTER_*.
+# Don't call dune directly for semgrep-core — use
+# 'make core' (or source tree-sitter-config.sh).
+include tree-sitter-config.mk
+_TS_DUNE := libs/ocaml-tree-sitter-semgrep/core/tree-sitter-out
+
+# Build the tree-sitter C runtime (headers + libtree-sitter).
+# Only the C library is built; the tree-sitter CLI (needs Rust/cargo) is not.
+.PHONY: tree-sitter-runtime
+tree-sitter-runtime:
+	dune build $(_TS_DUNE)
+
 # Minimal build of the semgrep-core executable. Intended for the docker build.
 # If you need other binaries, look at the build-xxx rules below.
 # We do not use .../bin/{semgrep-core,osemgrep,semgrep} below to
 # factorize because make under Alpine uses busybox/ash for /bin/sh which
 # does not support this bash feature.
 .PHONY: core
-core:
+core: tree-sitter-runtime
 	dune build $(BUILD)/install/default/bin/semgrep-core$(EXE)
 	dune build $(BUILD)/install/default/bin/osemgrep$(EXE)
 	chmod +w $(BUILD)/install/default/bin/semgrep-core$(EXE)
@@ -123,6 +131,8 @@ build-ojsonnet:
 .PHONY: clean
 clean:
 	dune clean
+	rm -rf libs/ocaml-tree-sitter-semgrep/core/bin
+	$(MAKE) -C libs/ocaml-tree-sitter-semgrep/lang clean
 # We still need to keep the nonempty opam files in git for
 # 'make setup', so we should only remove the empty opam files.
 # This removes the gitignored opam files.
@@ -150,7 +160,7 @@ uninstall:
 # Test target
 ###############################################################################
 
-# Note that this target is actually not used in CI; it's only for local dev
+# Core tests run locally and in platform CI jobs.
 .PHONY: test
 test: core-test
 
@@ -160,12 +170,35 @@ retest:
 	$(MAKE) build-core-test
 	./test run --lazy
 
-# Note that this target is actually not used in CI; it's only for local dev
+# Note that this target is actually not used in CI; it's only for local dev.
+# OTS unit tests are also covered in CI by ocaml-tree-sitter-ci.yml
+# (root `ots-test-ocaml` and `ots-test-python` targets).
 .PHONY: test-all
 test-all:
+	$(MAKE) test-scripts
 	$(MAKE) core-test
 	$(MAKE) -C cli test
 	$(MAKE) -C cli osempass
+	$(MAKE) ots-test
+
+# Vendored ocaml-tree-sitter-semgrep unit tests (OCaml dune + Python pytest).
+# coupling: .github/workflows/ocaml-tree-sitter-ci.yml runs the same targets.
+.PHONY: ots-test
+ots-test:
+	$(MAKE) ots-test-ocaml
+	$(MAKE) ots-test-python
+
+.PHONY: ots-test-ocaml
+ots-test-ocaml: grammar-tools
+	PATH="$(abspath libs/ocaml-tree-sitter-semgrep/core/bin):$$PATH" dune runtest libs/ocaml-tree-sitter-semgrep/core
+
+.PHONY: ots-test-python
+ots-test-python: setup-tree-sitter-versions
+	uv run --project cli --locked pytest libs/ocaml-tree-sitter-semgrep/scripts/test_*.py
+
+.PHONY: setup-tree-sitter-versions
+setup-tree-sitter-versions:
+	./libs/ocaml-tree-sitter-semgrep/core/scripts/provision-tree-sitter-all
 
 #coupling: this is run by .github/workflow/tests.yml
 .PHONY: core-test
@@ -184,7 +217,7 @@ core-test:
 # It rebuilds the test executable which can then be called with
 # './test <filter>' where <filter> selects the tests to run.
 .PHONY: build-core-test
-build-core-test:
+build-core-test: tree-sitter-runtime
 	dune build $(BUILD_DEFAULT)/src/tests/test.exe
 
 ###############################################################################
@@ -213,9 +246,9 @@ check-opam-conflicts: dune-project
 
 # We need to install all the dependencies in a single 'opam install'
 # command so as to detect conflicts.
-# WEIRD: if you use ./libs/ocaml-tree-sitter-core/ instead of the full
+# WEIRD: if you use ./libs/ocaml-tree-sitter-semgrep/ instead of the full
 # path, then recent versions of opam crash with a 'git ls-files fatal error'
-# about some 'libs/ocaml-tree-sitter-core/../../.git/...' not being a git
+# about some 'libs/ocaml-tree-sitter-semgrep/../../.git/...' not being a git
 # repo.
 #
 # EXTRA_OPAM_DEPS allows us to add more opam files when building semgrep
@@ -238,12 +271,63 @@ OPTIONAL_DEPS = $(REQUIRED_DEPS) ./dev/optional.opam
 # new packages that are not covered yet by our ocaml-layer docker image.
 .PHONY: install-deps-for-semgrep-core
 install-deps-for-semgrep-core:
-# Fetch, build and install the tree-sitter runtime library locally.
-	cd libs/ocaml-tree-sitter-core \
-	&& ./configure \
-	&& ./scripts/install-tree-sitter-lib
 	./scripts/build-static-libcurl.sh
 	$(MAKE) install-opam-deps
+# Build the tree-sitter runtime so grammar bindings can compile against it
+# (see TREESITTER_INCDIR/TREESITTER_LIBDIR and tree-sitter-runtime above).
+	opam exec -- dune build $(_TS_DUNE)
+
+# Standalone grammar jobs only; full setup solves all dependencies together.
+.PHONY: install-grammar-deps
+install-grammar-deps:
+	opam install --yes --deps-only ./libs/ocaml-tree-sitter-semgrep/core/tree-sitter.opam
+
+.PHONY: grammar-tools
+grammar-tools: tree-sitter-runtime
+	dune build libs/ocaml-tree-sitter-semgrep/core/bin/ocaml-tree-sitter libs/ocaml-tree-sitter-semgrep/core/tree-sitter.install
+
+# Regenerate an in-tree grammar, e.g. `make regen-grammar-python`.
+# Pattern rule (not LANG=) to avoid colliding with the LANG locale var.
+regen-grammar-%: grammar-tools
+	./libs/ocaml-tree-sitter-semgrep/scripts/regen-grammar $*
+
+.PHONY: test-grammars
+test-grammars: grammar-tools
+	$(MAKE) -C libs/ocaml-tree-sitter-semgrep/lang test
+
+test-grammar-%: grammar-tools
+	./libs/ocaml-tree-sitter-semgrep/scripts/test-grammar $*
+
+# Pin the upstream opam-repository to a known-good commit.
+# coupling: keep this commit in sync with opam_repository_pin in
+# .github/workflows/libs/semgrep.libsonnet
+#
+OPAM_REPOSITORY_PIN = git+https://github.com/ocaml/opam-repository.git\#922f67e068446a8d8e809a40251a259bd0549552
+
+# Extra flags forwarded to 'opam init' by 'opam-init'. The Dockerfiles pass
+# '--disable-sandboxing' since containers can't use the bubblewrap sandbox.
+OPAM_INIT_FLAGS ?=
+
+pin-opam-repo:
+	opam repository remove default --all-switches --yes
+	opam repository add default $(OPAM_REPOSITORY_PIN) --all-switches --set-default --yes
+
+# Initialize opam and pin to a commit of ocaml/opam-repository.
+opam-init:
+	opam init --bare --yes $(OPAM_INIT_FLAGS)
+	$(MAKE) pin-opam-repo
+
+# Create the opam switch, then install our fork of the compiler. Run
+# 'make opam-init' first to pin the opam-repository (the Dockerfiles do this).
+switch:
+	opam switch create 5.4.0 ocaml-variants.5.4.0+options ocaml-option-flambda -y -v
+	$(MAKE) pin-ocaml-fork
+
+switch-tsan:
+	opam switch create 5.4.0-tsan ocaml-variants.5.4.0+options ocaml-option-tsan -y -v
+	$(MAKE) pin-ocaml-fork-tsan
+	# For some reason tsan on x86 linux fails unless we preemptively install dune
+	opam install dune -y
 
 pin-ocaml-fork:
 	# the fork without TSan is pinned via our `semgrep.opam.template` file + `semgrep.opam`
@@ -251,7 +335,7 @@ pin-ocaml-fork:
 
 pin-ocaml-fork-tsan:
 	# NBT: our fork of the compiler
-	opam pin add ocaml-variants.5.3.0+options "git+https://github.com/semgrep/ocaml.git#5.3.0-semgrep-tsan" --update-invariant -y
+	opam pin add ocaml-variants.5.4.0+options "git+https://github.com/semgrep/ocaml.git#5.4.0-semgrep-tsan" --update-invariant -y
 # Install OCaml dependencies (globally) from *.opam files.
 # This now also installs the dev dependencies. This has the benefit
 # of installing all the packages in one shot and detecting possible
@@ -277,7 +361,7 @@ install-opam-deps: pin-ocaml-fork$(OPTIONS)
 	# use the opam cache by default, as third party package hosts are unreliable
 	opam option --global 'archive-mirrors="https://opam.ocaml.org/cache"'
 	# we want to install our forked OCaml compiler, however this contradicts
-	# the default 5.3.0 invariant of `ocaml-base-compiler = 5.3.0`.
+	# the default 5.4.0 invariant of `ocaml-base-compiler = 5.4.0`.
 	# --update-invariant does just that
 	OPAMSOLVERTIMEOUT=1500 LWT_DISCOVER_ARGUMENTS="--use-libev true" LIBRARY_PATH="$(HOMEBREW_PREFIX)/lib:$(LIBRARY_PATH)" opam install --locked --update-invariant --confirm-level=unsafe-yes -y --depext-only $(REQUIRED_DEPS)
 	OPAMSOLVERTIMEOUT=1500 LWT_DISCOVER_ARGUMENTS="--use-libev true" LIBRARY_PATH="$(HOMEBREW_PREFIX)/lib:$(LIBRARY_PATH)" opam install --locked --update-invariant --confirm-level=unsafe-yes -y --deps-only $(REQUIRED_DEPS)
@@ -384,6 +468,7 @@ setup:
 	./scripts/make-symlinks
 	./scripts/check-bash-version
 	./scripts/pick-lockfile.sh semgrep.opam
+	$(MAKE) pin-opam-repo
 	LIBRARY_PATH="$(HOMEBREW_PREFIX)/lib:$(LIBRARY_PATH)" $(MAKE) install-deps-for-semgrep-core
 
 # Install optional development dependencies in addition to build dependencies.
@@ -432,3 +517,8 @@ check_with_docker:
 dev:
 	$(MAKE) core
 	$(MAKE) copy-core-for-cli
+
+# Script tests include local Git repositories and require Git LFS.
+.PHONY: test-scripts
+test-scripts:
+	uv run --project cli --locked pytest scripts/tests

@@ -12,14 +12,20 @@ jobs:
         run: git config --global --add safe.directory $(pwd)
       - name: Make checkout speedy
         run: git config --global fetch.parallel 50
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           submodules: true
-      - uses: semgrep/setup-ocaml@a739c5405d73c42ef15a9dc995efc0f87396cc36
+      - env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: maintenance.auto
+          GIT_CONFIG_VALUE_0: "false"
+        uses: semgrep/setup-ocaml@a739c5405d73c42ef15a9dc995efc0f87396cc36
         with:
-          cache-prefix: v5
-          ocaml-compiler: ocaml-variants.5.3.0+options,ocaml-option-flambda
+          cache-prefix: v8-semgrep-${{ hashFiles('opam-lockfiles/*.locked', '*.opam', 'dev/required.opam', 'libs/ocaml-tree-sitter-semgrep/core/tree-sitter.opam', 'cli/src/semgrep/semgrep_interfaces/semgrep-interfaces.opam', 'OSS/opam-lockfiles/*.locked', 'OSS/*.opam', 'OSS/dev/required.opam', 'OSS/libs/ocaml-tree-sitter-semgrep/core/tree-sitter.opam', 'OSS/cli/src/semgrep/semgrep_interfaces/semgrep-interfaces.opam') }}
+          ocaml-compiler: ocaml-variants.5.4.0+options,ocaml-option-flambda
           opam-pin: false
+          opam-repositories: |
+            default: https://github.com/ocaml/opam-repository.git#922f67e068446a8d8e809a40251a259bd0549552
           save-opam-post-run: true
       - name: Install dependencies
         run: opam exec -- make install-deps
@@ -27,18 +33,10 @@ jobs:
         run: opam exec -- make
       - name: Test semgrep-core
         run: opam exec -- make test
-      - name: Make artifact for bin/semgrep-core
-        run: |
-          mkdir artifacts
-          cp -LR bin/semgrep-core artifacts/
-          tar czf artifacts.tgz artifacts
-          # so that we can untar later and not get a message
-          # about existing artifacts/ directory
-          rm -rf artifacts
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: semgrep-core-x86-artifact
-          path: artifacts.tgz
+          path: bin/semgrep-core
 name: build-test-core-x86
 on:
   workflow_call: null

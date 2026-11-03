@@ -70,7 +70,11 @@ else
             # old: was just '--copt -static --copy -no-pie' before we depended
             # on libcurl
             FLAGS=()
-            CCLIB=("-lssl" "-lcrypto" "-lz")
+            # Link libunwind.a and libstdc++.a as a group (obackward needs both);
+            # in sequence, libgcc_eh.a also gets pulled in and redefines
+            # _Unwind_Resume ("multiple definition").
+            CCLIB=("-lssl" "-lcrypto" "-lz"
+                "-Wl,--start-group" "-lunwind" "-lstdc++" "-Wl,--end-group")
             CCOPT=("-static" "-no-pie")
         else
             # On non-Alpine Linux distros (e.g., Ubuntu), we just dynamically
@@ -127,13 +131,14 @@ else
             "-lbase_stubs"
             "-locaml_intrinsics_kernel_stubs"
             "-lbigstringaf_stubs"
+            "-lobackward_stubs"
             "-lca_certs_stubs"
             "-lcamlstrnat"
             "-lcheckseum_c_stubs"
             "-lcomprmarsh"
             "-lcstruct_stubs"
             "-lctypes_stubs"
-            "-lcurl-helper"
+            "-lcurl_stubs"
             "-lintegers_stubs"
             "-llwt_unix_stubs"
             "-lmirage_crypto_ec_stubs"
@@ -143,8 +148,8 @@ else
             "-lmurmur3_stubs"
             "-lparmap_stubs"
             "-lpbrt_stubs"
-            "-lpcre_stubs"
             "-lpcre2_stubs"
+            "-lprocess_limits_stubs"
             "-lptime_clock_stubs"
             "-lstdc++"
             "-lterminal_size_stubs"
@@ -164,7 +169,6 @@ else
 
             "$(pkg-config gmp --variable libdir)/libgmp.a"
             "$(pkg-config tree-sitter --variable libdir)/libtree-sitter.a"
-            "$(pkg-config libpcre --variable libdir)/libpcre.a"
             "$(pkg-config libpcre2-8 --variable libdir)/libpcre2-8.a"
             "$(brew --prefix dwarfutils)/lib/libdwarf.a"
             "$(brew --prefix zstd)/lib/libzstd.a")

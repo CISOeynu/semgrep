@@ -142,10 +142,14 @@ let tests =
         Parser_regexp_tests.Unit_parsing.tests;
         Unit_ReDoS.tests;
         Unit_guess_lang.tests;
+        Unit_skip_target.tests;
         Unit_cgroup_limits.tests;
         Unit_memory_limit.tests ();
+        Unit_time_limit.tests;
         Unit_tok.tests;
         Unit_parsed_float.tests;
+        Unit_ast_generic.tests;
+        Unit_parsed_int.tests;
         Unit_fast_json.tests;
         Unit_Ppath.tests;
         Unit_Rpath.tests;
@@ -165,6 +169,8 @@ let tests =
         Unit_jsonnet.tests;
         Unit_metachecking.tests;
         Unit_http_helpers.tests;
+        Unit_keepalive_race.tests ~extra_tags:[ Test_tags.flaky ] ();
+        Unit_proxy.tests;
         (* osemgrep unit tests *)
         Unit_Login.tests;
         Unit_app.tests;

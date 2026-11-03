@@ -14,5 +14,9 @@
 let tests =
   Testo.categorize_suites "Collections"
     [
-      Unit_Hashtbl_.tests; Unit_List_.tests; Unit_Seq_.tests; Unit_Result_.tests;
+      Unit_Hashtbl_.tests;
+      Unit_Hashtbl_base.tests;
+      Unit_List_.tests;
+      Unit_Seq_.tests;
+      Unit_Result_.tests;
     ]

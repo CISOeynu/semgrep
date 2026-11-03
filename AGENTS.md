@@ -69,6 +69,7 @@ build errors.
 - Use conventional commits: `feat:`, `fix:`, `chore:`, `test:`, `docs:`
 - Keep commits focused and atomic
 - Reference issue numbers when applicable
+- Run pre-commit on every commit (`pre-commit install` once; never `--no-verify`)
 
 ### Changelog
 For any nontrivial user-facing change, add an entry under `changelog.d/`. Name the file after the Linear ticket with an appropriate suffix (e.g. `changelog.d/ENGINE-1234.fixed`). Valid suffixes are `.added`, `.changed`, `.fixed`, and `.infra` — see `changelog.d/README` for details.
@@ -84,6 +85,12 @@ Before submitting:
 See [Contributing docs](https://semgrep.dev/docs/contributing/contributing-code/) for detailed guidelines.
 
 ## Development
+
+### Grammar updates
+
+See [`libs/ocaml-tree-sitter-semgrep/doc/add-or-update-grammar.md`](libs/ocaml-tree-sitter-semgrep/doc/add-or-update-grammar.md):
+edit `libs/ocaml-tree-sitter-semgrep/lang/upstream-grammars.json`, then
+`make test-grammar-<name>` and `make regen-grammar-<dest>` from the repo root.
 
 ### Common Commands
 
@@ -130,6 +137,11 @@ This project uses **make** for build orchestration. **IMPORTANT: Never invoke `d
  - Avoid the implicit use of polymorphic compare, hash, etc. in complex data
    structures. Prefer instantiations of `Stdlib`'s `Map`/`Set` using
    ppx-generated compare functions, for example.
+ - New code uses `Base.Hashtbl.Poly` (or `Hashtbl_.Base` for the `Hashtbl_`
+   extension helpers) instead of stdlib `Hashtbl`. Stdlib `Hashtbl` remains
+   only at documented exception sites (marshalled tables, custom-equality
+   `Hashtbl.Make` functors, order-sensitive tables). Migration of existing
+   call sites is in progress.
 
 ### `ocamldoc` Guidelines
 
@@ -137,8 +149,8 @@ This project uses **make** for build orchestration. **IMPORTANT: Never invoke `d
    used in it.
  - NEVER document functions and types that are internal to a `.ml` file, unless that file's symbols
    are accessible to other `.ml` files.
- - ALWAYS document functions and types that are accessible to other source code.
- - NEVER document functions that are idiomatically converting from one type to another (e.g. `x_of_y`)
+ - ALWAYS document functions and types accessible to other source code (including `.mli` symbols),
+   except idiomatic type converters (e.g. `x_of_y`).
 
 ## Working with Tests
 

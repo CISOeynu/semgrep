@@ -174,9 +174,11 @@ let command (env : env) (x : command) : G.expr list =
       let args = [ unquoted_string_expr code ] in
       let loc = Loc.wrap_loc code in
       [ call_shell loc shell_compat args ]
-  | Shell_command_template (_loc, _args) ->
-      (* TODO: heredocs *)
-      []
+  | Shell_command_template (_loc, fragments) ->
+      fragments
+      |> List.map (function
+        | Constant_shell_fragment x -> unquoted_string_expr x
+        | Heredoc_template x -> unquoted_string_expr x.body)
 
 let param_arg (x : param) : G.argument =
   let _loc, (dashdash, (name_str, name_tok), _eq, value) = x in
@@ -357,6 +359,17 @@ let expose_port_expr (x : expose_port) : G.expr list =
             Tok.unsafe_fake_bracket
               [
                 unquoted_string_expr port_tok; unquoted_string_expr protocol_tok;
+              ] )
+        |> G.e;
+      ]
+  | Expose_port_fragment (port, protocol_tok) ->
+      [
+        G.Container
+          ( G.Tuple,
+            Tok.unsafe_fake_bracket
+              [
+                simple_docker_string_expr port;
+                unquoted_string_expr protocol_tok;
               ] )
         |> G.e;
       ]

@@ -15,7 +15,6 @@
 
 module Otel = Opentelemetry
 module Log = Log_telemetry.Log
-open Otel_util
 
 (*****************************************************************************)
 (* Prelude *)
@@ -27,11 +26,11 @@ open Otel_util
 (* Types *)
 (*****************************************************************************)
 
-type scope = Otel.Scope.t
+type scope = Otel.Span.t
 
 (* coupling: added to every metric in Ometrics.ml, so cannot contain spaces or
    special chars etc *)
-let show_scope (sp : scope) = sp.trace_id |> Otel.Trace_id.to_hex
+let show_scope (sp : scope) = Otel.Span.trace_id sp |> Otel.Trace_id.to_hex
 let pp_scope fmt (sp : scope) = Format.fprintf fmt "%s" (show_scope sp)
 
 type user_data = Otel.value
@@ -55,20 +54,25 @@ type config = {
 }
 [@@deriving show]
 
+type exporter_backend = Curl | Eio | No_exporter [@@deriving show]
+
 (*****************************************************************************)
 (* Constants *)
 (*****************************************************************************)
-(* The endpoint that otel traces will be sent to. This should only ever be set
-   in configure_otel, which is called once, at the beginning. The ref isn't
-   nice, but we need it to start and stop tracing without having to pass around
-   an env. See [with_otel_paused]
+(* Recreates the configured exporter after [with_otel_paused], preserving its
+   backend and environment. None when export is disabled. Eio restarts require
+   the original switch to remain open.
 
    TODO(SAF-1938): This is a Domain-local value in order to more closely match
    with ParMap (which re-creates its own endpoint after forking in order to
    pull random seeds - see [restart_otel]).  Once we are using multicore by
    default, we should revisit this.
    *)
-let active_endpoint = Domain.DLS.new_key (Fun.const None)
+let active_restart_exporter = Domain.DLS.new_key (Fun.const None)
+
+(* [Sdk.remove] returns before the queue drains, each client's
+   [remove_exporter] blocks until it has. Remember which one to call. *)
+let active_remove_exporter = Domain.DLS.new_key (Fun.const None)
 
 (* Service related attributes *)
 module Attributes = struct
@@ -94,10 +98,13 @@ end
 
 let ( let@ ) = ( @@ )
 
+(* The [Random.State.t] below is shared across domains. *)
+let rand_mutex = Mutex.create ()
+
 (* Needed so we can reset scope id's randomness on telemetry restart *)
 (* See restart_otel for more detail *)
 let mk_rand_bytes_8 rand_ () : bytes =
-  let@ () = Otel.Lock.with_lock in
+  let@ () = Mutex.protect rand_mutex in
   let b = Bytes.create 8 in
   for i = 0 to 1 do
     let r = Random.State.bits rand_ in
@@ -112,7 +119,7 @@ let mk_rand_bytes_8 rand_ () : bytes =
   b
 
 let mk_rand_bytes_16 rand_ () : bytes =
-  let@ () = Otel.Lock.with_lock in
+  let@ () = Mutex.protect rand_mutex in
   let b = Bytes.create 16 in
   for i = 0 to 4 do
     let r = Random.State.bits rand_ in
@@ -126,12 +133,12 @@ let mk_rand_bytes_16 rand_ () : bytes =
   (* last byte *)
   b
 
-let get_current_scope () = Otel.Scope.get_ambient_scope ()
+let get_current_scope () = Otel.Ambient_span.get ()
 
 let with_opt_scope scope_opt f =
   match scope_opt with
   | None -> f ()
-  | Some scope -> Otel.Scope.with_ambient_scope scope f
+  | Some scope -> Otel.Ambient_span.with_ambient scope f
 
 let force_curr_scope f =
   let current_scope_opt = get_current_scope () in
@@ -147,8 +154,7 @@ let set_global_attr_from_env () =
       match String.split_on_char '=' s with
       | [ a; b ] ->
           let value = Uri.pct_decode b in
-          Otel.Proto.Common.default_key_value ~key:a
-            ~value:(Some (String_value value)) ()
+          Otel.Proto.Common.make_key_value ~key:a ~value:(String_value value) ()
       | _ -> failwith (Printf.sprintf "invalid attribute: %S" s)
     in
     try
@@ -162,7 +168,7 @@ let set_global_attr_from_env () =
 let get_global_attr_opt key =
   List.find_map
     (fun (kv : Otel.Proto.Common.key_value) ->
-      if String.equal kv.key key then Some (_key_value_conv kv) else None)
+      if String.equal kv.key key then Some (Otel.Key_value.of_otel kv) else None)
     !Otel.Globals.global_attributes
 
 let find_global_attrs attr_keys = List.filter_map get_global_attr_opt attr_keys
@@ -170,63 +176,148 @@ let find_global_attrs attr_keys = List.filter_map get_global_attr_opt attr_keys
 (*****************************************************************************)
 (* Entry points for setting up telemetry *)
 (*****************************************************************************)
+(* The exporter workers must belong to the shutdown race's switch: timing out
+   remove_exporter alone leaves the caller's switch waiting for HTTP requests.
+   Start the deadline only when shutdown is requested, not during the scan. *)
+let create_eio_exporter ~(config : Opentelemetry_client_cohttp_eio.Config.t)
+    ~(sw : Eio.Switch.t) ~(env : Eio_unix.Stdenv.base) () :
+    Otel.Exporter.t * (unit -> unit) =
+  let exporter, publish_exporter = Eio.Promise.create () in
+  let stop, request_stop = Eio.Promise.create () in
+  let drained, finish_drain = Eio.Promise.create () in
+  let stopped, finish_stop = Eio.Promise.create () in
+  Eio.Fiber.fork ~sw (fun () ->
+      Eio.Fiber.first
+        (fun () ->
+          Eio.Switch.run (fun sw ->
+              let exporter =
+                Opentelemetry_client_cohttp_eio.create_exporter ~config ~sw ~env
+                  ()
+              in
+              Eio.Promise.resolve publish_exporter exporter;
+              Eio.Promise.await drained))
+        (fun () ->
+          Eio.Promise.await stop;
+          Eio.Time.Mono.sleep env#mono_clock
+            (float_of_int (max 0 config.timeout_ms) /. 1000.);
+          Log.debug (fun m ->
+              m "Tracing shutdown timed out; dropping remaining telemetry"));
+      Eio.Promise.resolve finish_stop ());
+  let remove_exporter () : unit =
+    (* Detach the SDK before starting the deadline, including a zero timeout. *)
+    Otel.Sdk.remove ~on_done:(Eio.Promise.resolve finish_drain) ();
+    Eio.Promise.resolve request_stop ();
+    Eio.Promise.await stopped
+  in
+  (Eio.Promise.await exporter, remove_exporter)
+
 (* Safe to call whenever *)
 let stop_otel () =
-  (* hack: get the backend so we can easily stop tracing at any time. See
-     [with_paused_tracing] for why we want the option to do this
-  *)
-  Otel.Collector.get_backend ()
-  |> Option.iter (fun backend ->
-      Log.info (fun m -> m "Stopping tracing");
-      let module Backend = (val backend : Otel.Collector.BACKEND) in
-      Otel.Collector.remove_backend ~on_done:Fun.id ();
-      Backend.cleanup ~on_done:Fun.id ())
+  if Otel.Sdk.present () then (
+    Log.info (fun m -> m "Stopping tracing");
+    match Domain.DLS.get active_remove_exporter with
+    | Some remove_exporter -> remove_exporter ()
+    | None -> Otel.Sdk.remove ~on_done:Fun.id ())
+
+let select_exporter_backend ~curl_supported ~eio =
+  if eio then Eio else if curl_supported then Curl else No_exporter
 
 (* setup_otel sets the Otel tracing backend and Trace_core tracing backend *)
 let setup_otel ?eio_sw_base trace_endpoint =
   let url = Uri.to_string trace_endpoint in
   Log.info (fun m -> m "Tracing endpoint set to %s" url);
-  let otel_backend =
+  let ( exporter,
+        remove_exporter,
+        (common : Opentelemetry_client.Exporter_config.t) ) =
     match eio_sw_base with
     | None ->
         let config = Opentelemetry_client_ocurl.Config.make ~url () in
-        Opentelemetry_client_ocurl.create_backend ~config ()
+        ( Opentelemetry_client_ocurl.create_exporter ~config (),
+          Opentelemetry_client_ocurl.remove_exporter,
+          config.common )
     | Some (sw, base) ->
         (* If we are provided an eio switch + base let's use the eio backend
            since the curl backend has been known to segfault *)
         let config = Opentelemetry_client_cohttp_eio.Config.make ~url () in
-        Opentelemetry_client_cohttp_eio.create_backend ~sw ~config base
+        let exporter, remove_exporter =
+          create_eio_exporter ~config ~sw ~env:base ()
+        in
+        (exporter, remove_exporter, config)
   in
-  (* hack: let's just keep track of the endpoint for if we restart tracing
-     instead of having to pass it down everywhere. We will assume that we will
-     only ever report to one endpoint for the lifetime of the program *)
-  Domain.DLS.set active_endpoint (Some trace_endpoint);
-  (* Set the Otel Collector *)
-  Otel.Collector.set_backend otel_backend
+  Domain.DLS.set active_remove_exporter (Some remove_exporter);
+  (* We bypass the client's setup helper, so pass its batching config through
+     ourselves; it carries the OTEL_* env var settings. *)
+  Otel.Sdk.set ~traces:common.traces ~metrics:common.metrics ~logs:common.logs
+    exporter
 
-(* Set according to README of https://github.com/imandra-ai/ocaml-opentelemetry/ *)
-let configure_otel ?eio_sw_base ?(attrs : (string * user_data) list = [])
-    service_name trace_endpoint =
+(* We wrap [Ambient_context_eio.storage]. In ambient-context 0.2 they fixed a
+   bug(?) where ambient context was per thread, and so in new threads it would
+   fall back from eio to a thread level storage mechanism. unfortunately for us
+   in non main threads we do secret validation via lwt which means the eio
+   effect handler isnt set. this ensures even if we are in a non eio context we
+   still get some ambient context even if its empty, so we can do things like
+   send logs (although this means spans from lwt contexts might not work
+   well) *)
+let eio_ambient_storage : Opentelemetry_ambient_context.Storage.t =
+  let eio : Opentelemetry_ambient_context.Storage.t =
+    Ambient_context_eio.storage
+  in
+  let in_fiber () =
+    match eio.get_context () with
+    | _ -> true
+    | exception Effect.Unhandled _ -> false
+  in
+  {
+    name = "eio-or-empty";
+    get_context =
+      (fun () ->
+        match eio.get_context () with
+        | ctx -> ctx
+        | exception Effect.Unhandled _ ->
+            Opentelemetry_ambient_context.Context.empty);
+    with_context =
+      (fun ctx f -> if in_fiber () then eio.with_context ctx f else f ());
+  }
+
+(* Set according to README of https://github.com/ocaml-tracing/ocaml-opentelemetry/ *)
+let configure_exporter ?eio_sw_base ~attrs service_name trace_endpoint =
   set_global_attr_from_env ();
   Otel.Globals.service_name := service_name;
   Otel.Globals.default_span_kind := Otel.Span.Span_kind_internal;
   (* Disable self tracing, e.g. tracing the otel library *)
   Opentelemetry_client.Self_trace.set_enabled false;
-  let attrs = attrs @ Otel.GC_metrics.get_runtime_attributes () in
+  let attrs = attrs @ Otel.Globals.get_runtime_attributes () in
   List.iter
     (fun (key, value) -> Otel.Globals.add_global_attribute key value)
     attrs;
   Log.info (fun m -> m "Setting up tracing with service name %s" service_name);
-  Otel.GC_metrics.basic_setup ();
+  Otel.Gc_metrics.basic_setup ();
   let ambient_storage_provider =
     match eio_sw_base with
     (* If we are provided an eio switch + base we know we are going to use eio,
        so let's use that as our ambient context storage provider *)
-    | None -> Ambient_context_lwt.storage ()
-    | Some _ -> Opentelemetry_ambient_context_eio.storage ()
+    | None -> Ambient_context_lwt.storage
+    | Some _ -> eio_ambient_storage
   in
-  Ambient_context.set_storage_provider ambient_storage_provider;
-  setup_otel ?eio_sw_base trace_endpoint
+  Opentelemetry_ambient_context.set_current_storage ambient_storage_provider;
+  setup_otel ?eio_sw_base trace_endpoint;
+  Domain.DLS.set active_restart_exporter
+    (Some (fun () -> setup_otel ?eio_sw_base trace_endpoint))
+
+let configure_otel ?eio_sw_base ?(curl_supported = false)
+    ?(attrs : (string * user_data) list = []) service_name trace_endpoint =
+  match
+    select_exporter_backend ~curl_supported ~eio:(Option.is_some eio_sw_base)
+  with
+  | No_exporter ->
+      Domain.DLS.set active_restart_exporter None;
+      Log.warn (fun m ->
+          m
+            "Tracing export is unavailable on this platform without the Eio \
+             backend; no telemetry will be sent")
+  | Curl
+  | Eio ->
+      configure_exporter ?eio_sw_base ~attrs service_name trace_endpoint
 
 let restart_otel () =
   (* We must re-initialize the randomness on restart since this usually happens
@@ -234,18 +325,18 @@ let restart_otel () =
      the same randomness and use duplicate span ids! This behavior is fine in
      jaeger but duplicates don't show up in datadog *)
   let new_random_state = Random.State.make_self_init () in
-  Otel.Rand_bytes.rand_bytes_8 := mk_rand_bytes_8 new_random_state;
-  Otel.Rand_bytes.rand_bytes_16 := mk_rand_bytes_16 new_random_state;
-  Domain.DLS.get active_endpoint
-  |> Option.iter (fun endpoint ->
+  Otel.Core.Rand_bytes.rand_bytes_8_ref := mk_rand_bytes_8 new_random_state;
+  Otel.Core.Rand_bytes.rand_bytes_16_ref := mk_rand_bytes_16 new_random_state;
+  Domain.DLS.get active_restart_exporter
+  |> Option.iter (fun restart ->
       Log.info (fun m -> m "Restarting tracing");
-      setup_otel endpoint)
+      restart ())
 
 (* Otel SOMETIMES segfaults if the traced process forks while the collector is running. So we
    need to stop the backends before forking, then continue after forking is
    done.
 
-   See https://github.com/imandra-ai/ocaml-opentelemetry/issues/68
+   See https://github.com/ocaml-tracing/ocaml-opentelemetry/issues/68
 *)
 let with_otel_paused f =
   (* Don't exit current spans here since we only want to pause *)

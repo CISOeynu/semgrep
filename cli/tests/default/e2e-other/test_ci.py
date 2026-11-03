@@ -29,6 +29,7 @@ import tempfile
 from collections import defaultdict
 from pathlib import Path
 from textwrap import dedent
+from typing import Any
 from typing import Dict
 from typing import List
 from typing import Mapping
@@ -51,6 +52,7 @@ from tests.fixtures import RunSemgrep
 import semgrep.run_scan
 import semgrep.semgrep_interfaces.semgrep_output_v1 as out
 from semdep.parsers.util import DependencyParserError
+from semgrep import telemetry
 from semgrep.app.scans import ScanHandler
 from semgrep.constants import OutputFormat
 from semgrep.core_runner import CoreRunner
@@ -66,8 +68,10 @@ from semgrep.output import OutputHandler
 from semgrep.output_extra import OutputExtra
 from semgrep.rpc import RpcSession
 from semgrep.rule import Rule
+from semgrep.rule_lang import RuleValidationMode
 from semgrep.rule_match import RuleMatchMap
 from semgrep.settings import generate_anonymous_user_id
+from semgrep.state import get_state
 from semgrep.subproject import DependencyResolutionConfig
 from semgrep.symbol_analysis import SubprojectSymbolAnalysis
 from semgrep.target_manager import SAST_PRODUCT
@@ -524,10 +528,13 @@ def start_scan_mock_maker(
         semgrep_url: str = "https://semgrep.dev",
         product_ignored_files: Mapping[out.Product, List[str]] = {},  # noqa
         project_merge_base: Optional[str] = None,
+        enabled_products: Optional[List[str]] = None,
     ):
         scan_info = {
             **({"id": mocked_scan_id} if mocked_scan_id else {}),
-            "enabled_products": ["sast", "sca"],
+            "enabled_products": (
+                enabled_products if enabled_products is not None else ["sast", "sca"]
+            ),
             "deployment_id": DEPLOYMENT_ID,
             "deployment_name": "org_name",
         }
@@ -1753,6 +1760,257 @@ def test_nosem(
     )
 
 
+@pytest.mark.osemfail
+@pytest.mark.parametrize(
+    ("nosem_flag", "config_nosemgrep_disabled", "expected_disable_nosem"),
+    [
+        # No flag passed: the app's nosemgrep_disabled config drives behavior.
+        (None, True, True),
+        (None, False, False),
+        # An explicit flag always wins; the config value is ignored.
+        ("--enable-nosem", True, False),
+        ("--disable-nosem", False, True),
+    ],
+)
+def test_nosem_config_precedence(
+    git_tmp_path_with_commit,
+    mocker,
+    nosem_flag,
+    config_nosemgrep_disabled,
+    expected_disable_nosem,
+    run_semgrep: RunSemgrep,
+    start_scan_mock_maker,
+    complete_scan_mock_maker,
+    upload_results_mock_maker,
+):
+    """`semgrep ci` honors nosemgrep_disabled from the scan config only when
+    neither --enable-nosem nor --disable-nosem was passed; an explicit flag
+    always wins over the config value."""
+    start_scan_mock_maker("https://semgrep.dev")
+    complete_scan_mock_maker("https://semgrep.dev")
+    upload_results_mock_maker("https://semgrep.dev")
+
+    # Simulate the org-wide setting the app sends in the scan config.
+    mocker.patch.object(ScanHandler, "nosemgrep_disabled", config_nosemgrep_disabled)
+
+    # Capture the resolved run_scan args, then short-circuit so we don't need a
+    # real scan to assert how nosemgrep handling was resolved.
+    captured: Dict = {}
+
+    def fake_run_scan(**kwargs):
+        captured.update(kwargs)
+        raise SemgrepError("stop after capturing args", code=2)
+
+    mocker.patch.object(semgrep.run_scan, "run_scan", side_effect=fake_run_scan)
+
+    options = ["--no-suppress-errors", "--oss-only"]
+    if nosem_flag:
+        options.append(nosem_flag)
+
+    run_semgrep(
+        subcommand="ci",
+        options=options,
+        target_name=None,
+        strict=False,
+        assert_exit_code=2,
+        env={"SEMGREP_APP_TOKEN": "fake_key"},
+        use_click_runner=True,
+    )
+
+    assert captured["disable_nosem"] is expected_disable_nosem
+
+
+@pytest.mark.osemfail  # This test inspects Python-only telemetry via a mock.
+@pytest.mark.parametrize(
+    ("app_products", "options", "expected_products"),
+    [
+        (["sast", "sca", "secrets"], [], (True, True, True)),
+        (["sast", "sca", "secrets"], ["--oss-only"], (True, True, False)),
+        (["sast"], ["--supply-chain"], (True, True, False)),
+        (["sca"], ["--code"], (True, True, False)),
+        (["sast"], ["--secrets"], (True, False, True)),
+        (["sca"], [], (False, True, False)),
+    ],
+)
+def test_scan_product_telemetry_from_flags_and_app(
+    git_tmp_path_with_commit,
+    mocker,
+    app_products,
+    options,
+    expected_products,
+    run_semgrep: RunSemgrep,
+    start_scan_mock_maker,
+):
+    start_scan_mock_maker(enabled_products=app_products)
+    mocker.patch.object(EngineType, "check_if_installed", return_value=True)
+    mocker.patch.object(EngineType, "get_pro_version", return_value="test")
+    mocker.patch.object(EngineType, "get_binary_path", return_value=Path("/tmp/core"))
+
+    def fake_run_scan(**kwargs):
+        raise SemgrepError("stop after capturing telemetry", code=2)
+
+    product_attrs = mocker.spy(telemetry, "scan_product_attrs")
+    mocker.patch.object(semgrep.run_scan, "run_scan", side_effect=fake_run_scan)
+
+    run_semgrep(
+        subcommand="ci",
+        options=["--no-suppress-errors", *options],
+        target_name=None,
+        strict=False,
+        assert_exit_code=2,
+        env={"SEMGREP_APP_TOKEN": "fake_key"},
+        use_click_runner=True,
+    )
+
+    product_attrs.assert_called_once_with(
+        code=expected_products[0],
+        supply_chain=expected_products[1],
+        secrets=expected_products[2],
+    )
+
+
+@pytest.mark.osemfail  # This test inspects Python-only telemetry via a mock.
+@pytest.mark.parametrize(
+    ("rule_body", "options", "expected_products"),
+    [
+        ("pattern: foo", [], (True, False, False)),
+        (
+            "r2c-internal-project-depends-on:\n"
+            "    namespace: pypi\n"
+            "    package: badlib\n"
+            '    version: "== 99.99.99"',
+            [],
+            (False, True, False),
+        ),
+        (
+            "r2c-internal-project-depends-on:\n"
+            "    namespace: pypi\n"
+            "    package: badlib\n"
+            '    version: "== 99.99.99"',
+            ["--code"],
+            (True, True, False),
+        ),
+    ],
+)
+def test_scan_product_telemetry_from_explicit_config(
+    git_tmp_path_with_commit,
+    tmp_path,
+    mocker,
+    run_semgrep: RunSemgrep,
+    rule_body,
+    options,
+    expected_products,
+):
+    rule_file = tmp_path / "rule.yaml"
+    rule_file.write_text(
+        "rules:\n"
+        "- id: product-rule\n"
+        "  message: product rule\n"
+        "  languages: [python]\n"
+        "  severity: ERROR\n"
+        f"  {rule_body}\n"
+    )
+    observed = []
+    real_product_attrs = telemetry.scan_product_attrs
+
+    def capture_product_attrs(*, code, supply_chain, secrets):
+        observed.append((code, supply_chain, secrets))
+        if len(observed) == 2:
+            raise SemgrepError("stop after resolving products", code=2)
+        return real_product_attrs(code=code, supply_chain=supply_chain, secrets=secrets)
+
+    mocker.patch.object(
+        telemetry, "scan_product_attrs", side_effect=capture_product_attrs
+    )
+
+    run_semgrep(
+        subcommand="ci",
+        options=[
+            "--config",
+            str(rule_file),
+            "--x-rule-validation",
+            "none",
+            "--no-suppress-errors",
+            *options,
+        ],
+        target_name=None,
+        strict=False,
+        assert_exit_code=2,
+        env={"SEMGREP_APP_TOKEN": ""},
+        use_click_runner=True,
+    )
+
+    assert len(observed) == 2
+    assert observed[-1] == expected_products
+
+
+@pytest.mark.osemfail  # This test inspects Python-only telemetry via mocks.
+def test_nested_join_scan_preserves_ci_product_telemetry(
+    git_tmp_path_with_commit,
+    tmp_path,
+    mocker,
+    run_semgrep: RunSemgrep,
+    start_scan_mock_maker,
+):
+    start_scan_mock_maker(enabled_products=["sast", "sca"])
+    mocker.patch.object(EngineType, "check_if_installed", return_value=True)
+    mocker.patch.object(EngineType, "get_pro_version", return_value="test")
+    mocker.patch.object(EngineType, "get_binary_path", return_value=Path("/tmp/core"))
+
+    rule_file = tmp_path / "join-part.yaml"
+    rule_file.write_text(
+        "rules:\n"
+        "- id: join-part\n"
+        "  pattern: foo\n"
+        "  message: join rule part\n"
+        "  languages: [python]\n"
+        "  severity: ERROR\n"
+    )
+    real_run_scan = semgrep.run_scan.run_scan
+
+    class StopNestedScan(Exception):
+        pass
+
+    mocker.patch.object(
+        semgrep.run_scan, "add_metrics_part1", side_effect=StopNestedScan
+    )
+
+    def fake_run_scan(**kwargs):
+        resource = get_state().telemetry.resource
+        assert resource is not None
+        attrs = resource.attributes
+        assert attrs is not None
+        before = dict(attrs)
+
+        with pytest.raises(StopNestedScan):
+            real_run_scan(
+                output_handler=kwargs["output_handler"],
+                scanning_roots=kwargs["scanning_roots"],
+                pattern=None,
+                lang=None,
+                config_strs=[str(rule_file)],
+                validation_mode=RuleValidationMode.NONE,
+                record_scan_product_attrs=False,
+            )
+
+        attrs = resource.attributes
+        assert attrs is not None
+        assert attrs["scan.product.supply_chain"] == before["scan.product.supply_chain"]
+        raise SemgrepError("stop after checking telemetry", code=2)
+
+    mocker.patch.object(semgrep.run_scan, "run_scan", side_effect=fake_run_scan)
+
+    run_semgrep(
+        subcommand="ci",
+        options=["--no-suppress-errors"],
+        target_name=None,
+        strict=False,
+        assert_exit_code=2,
+        env={"SEMGREP_APP_TOKEN": "fake_key"},
+        use_click_runner=True,
+    )
+
+
 # Regression for ENGINE-1824: `semgrep ci --sarif-output` must preserve
 # nosemgrep-suppressed findings in the SARIF file with `suppressions`
 # entries, not drop them entirely. The bucketing in commands/ci.py must
@@ -1801,6 +2059,57 @@ def test_ci_sarif_output_preserves_nosemgrep_suppressions(
         assert r["suppressions"] == [{"kind": "inSource"}], r
 
 
+# Regression: --sarif-output must not zero out `CiScanResults.ignores`
+# on upload. Previously the JSON path populated it but the SARIF path
+# did not.
+@pytest.mark.kinda_slow
+@pytest.mark.parametrize(
+    "extra_options,expect_in_sarif_file",
+    [
+        ([], False),
+        (["--sarif-output", "out.sarif"], True),
+    ],
+    ids=["no-sarif", "sarif-output"],
+)
+@pytest.mark.osemfail  # osemgrep does not write --sarif-output files
+def test_ci_upload_ignores_field_populated_under_sarif(
+    git_tmp_path_with_commit,
+    mock_autofix,
+    run_semgrep: RunSemgrep,
+    start_scan_mock_maker,
+    complete_scan_mock_maker,
+    upload_results_mock_maker,
+    extra_options,
+    expect_in_sarif_file,
+):
+    start_scan_mock_maker("https://semgrep.dev")
+    complete_scan_mock_maker("https://semgrep.dev")
+    upload_results_mock = upload_results_mock_maker("https://semgrep.dev")
+
+    run_semgrep(
+        subcommand="ci",
+        options=[
+            "--no-suppress-errors",
+            "--oss-only",
+            "--enable-nosem",
+            *extra_options,
+        ],
+        target_name=None,
+        strict=False,
+        assert_exit_code=1,
+        env={"SEMGREP_APP_TOKEN": "fake_key"},
+        use_click_runner=True,
+    )
+
+    uploaded = upload_results_mock.last_request.json()
+    assert len(uploaded["ignores"]) > 0, uploaded
+
+    if expect_in_sarif_file:
+        sarif = json.loads(Path("out.sarif").read_text())
+        suppressed = [r for r in sarif["runs"][0]["results"] if r.get("suppressions")]
+        assert len(suppressed) > 0, sarif["runs"][0]["results"]
+
+
 @pytest.mark.parametrize(
     "scan_config",
     [GENERIC_SECRETS_AND_REAL_RULE],
@@ -1838,6 +2147,53 @@ def test_generic_secrets_output(
     # the rule message doesn't show. these go straight to the App with minimal
     # CLI output
     assert "generic secrets rule message" not in result.raw_stdout
+
+
+SECRETS_ONLY_CONFIG = dedent(
+    """
+    rules:
+    - id: secret-rule-example
+      pattern: $X == $X
+      message: "secret rule message"
+      languages: [python]
+      severity: ERROR
+      metadata:
+        product: secrets
+    """
+)
+
+
+@pytest.mark.parametrize("scan_config", [SECRETS_ONLY_CONFIG], ids=["secrets_only"])
+@pytest.mark.osemfail
+def test_secrets_only_hides_code_scan_status(
+    git_tmp_path_with_commit,
+    run_semgrep: RunSemgrep,
+    mocker,
+    start_scan_mock_maker,
+    complete_scan_mock_maker,
+    upload_results_mock_maker,
+):
+    """When the Code product is not enabled, `semgrep ci` should not claim
+    "0 Code rules" and should say code scanning is not enabled rather than print
+    an empty code table (ENGINE-2878)."""
+    mocker.patch.object(ScanHandler, "enabled_products", ["secrets"])
+    start_scan_mock_maker("https://semgrep.dev")
+    complete_scan_mock_maker("https://semgrep.dev")
+    upload_results_mock_maker("https://semgrep.dev")
+
+    result = run_semgrep(
+        subcommand="ci",
+        target_name=None,
+        strict=False,
+        assert_exit_code=None,
+        options=["--oss-only"],
+        env={"SEMGREP_APP_TOKEN": "fake_key"},
+        use_click_runner=True,
+    )
+
+    assert "with 0 Code rules" not in result.stderr
+    assert "Code scanning is not enabled." in result.stderr
+    assert "No code rules to run." not in result.stderr
 
 
 @pytest.mark.osemfail
@@ -1963,7 +2319,7 @@ def test_fail_auth_invalid_key_suppressed_by_default(
         "method": "POST",
         "status_code": 401,
         "request_id": scan_create.last_request.json()["scan_metadata"]["unique_id"],
-        "error": str_containing("INVALID_API_KEY_EXIT_CODE"),
+        "error": str_containing("SystemExit: 13"),
         "exit_code": 13,
     }
 
@@ -2234,6 +2590,291 @@ def test_backend_exit_code(
         env={"SEMGREP_APP_TOKEN": "fake-key-from-tests"},
         use_click_runner=True,
     )
+
+
+def _gradle_subproject(path: str) -> out.Subproject:
+    return out.Subproject(
+        root_dir=out.Fpath("."),
+        dependency_source=out.DependencySource(
+            out.ManifestOnly(
+                out.Manifest(out.ManifestKind(out.BuildGradle()), out.Fpath(path))
+            )
+        ),
+        ecosystem=out.Ecosystem(out.Maven()),
+    )
+
+
+def _resolution_error(kind) -> out.ScaError:
+    return out.ScaError(
+        out.SCAResol(
+            out.ScaResolutionError(
+                type_=out.ResolutionErrorKind(kind),
+                dependency_source_file=out.Fpath("build.gradle"),
+            )
+        )
+    )
+
+
+def _unresolved(path: str, reason, errors=()) -> out.UnresolvedSubproject:
+    return out.UnresolvedSubproject(
+        info=_gradle_subproject(path),
+        reason=out.UnresolvedReason(reason),
+        errors=list(errors),
+    )
+
+
+def _resolved(path: str, errors=()) -> out.ResolvedSubproject:
+    return out.ResolvedSubproject(
+        info=_gradle_subproject(path),
+        resolution_method=out.ResolutionMethod(out.DynamicResolution()),
+        ecosystem=out.Ecosystem(out.Maven()),
+        resolved_dependencies={},
+        errors=list(errors),
+    )
+
+
+_CMD_FAILED = _resolution_error(
+    out.ResolutionCmdFailed_(out.ResolutionCmdFailed("gradlew", "boom"))
+)
+_REGISTRY_REFUSED = _resolution_error(
+    out.ResourceInaccessible_(out.ResourceInaccessible("gradlew", None, "401"))
+)
+
+# The repo made by `git_tmp_path_with_commit` always has blocking findings, so
+# without a resolution failure `semgrep ci` exits 1. That also lets these tests
+# check that a resolution failure (exit 2) wins over blocking findings.
+_BLOCKING_FINDINGS_EXIT_CODE = 1
+
+
+@pytest.mark.osemfail
+@pytest.mark.parametrize(
+    "options, admin_forces_suppress, subprojects, expected_exit_code, expected_failures",
+    [
+        pytest.param(
+            ["--no-suppress-errors", "--allow-local-builds"],
+            False,
+            # A monorepo: one subproject resolves, one build fails.
+            [
+                _resolved("ok/build.gradle"),
+                _unresolved("bad/build.gradle", out.UnresolvedFailed(), [_CMD_FAILED]),
+            ],
+            2,
+            ["bad/build.gradle: Resolution Command Failed"],
+            id="build-failed-in-monorepo",
+        ),
+        pytest.param(
+            ["--no-suppress-errors", "--allow-local-builds"],
+            False,
+            [_resolved("a/build.gradle", [_REGISTRY_REFUSED])],
+            2,
+            ["a/build.gradle: Resource Inaccessible"],
+            id="resolved-but-incomplete",
+        ),
+        pytest.param(
+            ["--allow-local-builds"],
+            False,
+            [_unresolved("a/build.gradle", out.UnresolvedFailed(), [_CMD_FAILED])],
+            _BLOCKING_FINDINGS_EXIT_CODE,
+            [],
+            id="errors-suppressed-by-default",
+        ),
+        pytest.param(
+            ["--no-suppress-errors", "--allow-local-builds"],
+            True,
+            [_unresolved("a/build.gradle", out.UnresolvedFailed(), [_CMD_FAILED])],
+            _BLOCKING_FINDINGS_EXIT_CODE,
+            [],
+            id="admin-forces-suppress",
+        ),
+        pytest.param(
+            ["--no-suppress-errors"],
+            False,
+            [_unresolved("a/build.gradle", out.UnresolvedFailed(), [_CMD_FAILED])],
+            _BLOCKING_FINDINGS_EXIT_CODE,
+            [],
+            id="local-builds-not-allowed",
+        ),
+        pytest.param(
+            ["--no-suppress-errors", "--allow-local-builds"],
+            False,
+            [
+                _resolved("ok/build.gradle"),
+                _unresolved("skipped/build.gradle", out.UnresolvedSkipped()),
+                _unresolved("disabled/build.gradle", out.UnresolvedDisabled()),
+                _unresolved("unsupported/build.gradle", out.UnresolvedUnsupported()),
+            ],
+            _BLOCKING_FINDINGS_EXIT_CODE,
+            [],
+            id="nothing-attempted-failed",
+        ),
+        pytest.param(
+            [
+                "--no-suppress-errors",
+                "--allow-local-builds",
+                "--internal-ci-scan-results",
+            ],
+            False,
+            [_unresolved("a/build.gradle", out.UnresolvedFailed(), [_CMD_FAILED])],
+            _BLOCKING_FINDINGS_EXIT_CODE,
+            [],
+            id="internal-ci-scan-results",
+        ),
+    ],
+)
+def test_dependency_resolution_failure_exit_code(
+    run_semgrep: RunSemgrep,
+    mocker,
+    requests_mock,
+    scan_config,
+    git_tmp_path_with_commit,
+    start_scan_mock_maker,
+    complete_scan_mock_maker,
+    upload_results_mock_maker,
+    options,
+    admin_forces_suppress,
+    subprojects,
+    expected_exit_code,
+    expected_failures,
+):
+    """
+    SC-3613: with --no-suppress-errors (and local builds allowed), a subproject
+    whose dependency resolution failed or came back incomplete makes `semgrep
+    ci` exit 2 and stop saying it completed successfully.
+
+    The app is deliberately not told: the /complete request still carries the
+    CLI's suggested exit code (1 here, from the blocking findings), as it does
+    for other errors that --no-suppress-errors surfaces.
+    """
+    mocker.patch.object(
+        semgrep.run_scan,
+        "resolve_dependencies",
+        return_value=(
+            [],
+            [e for sub in subprojects for e in sub.errors],
+            [],
+            subprojects,
+            {},
+        ),
+    )
+
+    start_scan_mock_maker("https://semgrep.dev")
+    if admin_forces_suppress:
+        # The app tells the CLI to suppress errors, in the scan config response
+        # (the same way the real app does), not by patching the CLI.
+        requests_mock.get(
+            re.compile(r"/api/cli/v2/scans/[^/]+/config"),
+            json={
+                "status": "success",
+                "config": {"rules": YAML(typ="safe").load(scan_config)},
+                "engine_params": {
+                    "dependency_query": False,
+                    "product_ignored_files": [],
+                    "always_suppress_errors": True,
+                },
+            },
+        )
+    complete_scan_mock = complete_scan_mock_maker("https://semgrep.dev")
+    upload_results_mock_maker("https://semgrep.dev")
+
+    result = run_semgrep(
+        subcommand="ci",
+        options=[*options, "--oss-only"],
+        target_name=None,
+        strict=False,
+        assert_exit_code=expected_exit_code,
+        env={"SEMGREP_APP_TOKEN": "fake-key-from-tests"},
+        use_click_runner=True,
+    )
+
+    assert (
+        complete_scan_mock.last_request.json()["exit_code"]
+        == _BLOCKING_FINDINGS_EXIT_CODE
+    )
+
+    if expected_failures:
+        assert "CI scan completed successfully" not in result.stderr
+        assert (
+            f"Dependency resolution failed for {len(expected_failures)} subproject"
+            in result.stderr
+        )
+        for failure in expected_failures:
+            assert f"- {failure}" in result.stderr
+        # only the failed subprojects are listed
+        assert "- ok/build.gradle" not in result.stderr
+    else:
+        assert "CI scan completed successfully" in result.stderr
+        assert "Dependency resolution failed" not in result.stderr
+
+
+@pytest.mark.osemfail
+@pytest.mark.parametrize(
+    "managed_scan_id, expected_exit_code, expect_failure",
+    [
+        pytest.param(None, 2, True, id="ci-scan"),
+        pytest.param("555", _BLOCKING_FINDINGS_EXIT_CODE, False, id="managed-scan"),
+    ],
+)
+def test_dependency_resolution_failure_skipped_for_managed_scans(
+    run_semgrep: RunSemgrep,
+    mocker,
+    git_tmp_path_with_commit,
+    start_scan_mock_maker,
+    complete_scan_mock_maker,
+    upload_results_mock_maker,
+    managed_scan_id,
+    expected_exit_code,
+    expect_failure,
+):
+    """
+    SC-3613: Semgrep Managed Scanning always passes --no-suppress-errors (and
+    --allow-local-builds when enabled), so nobody opted in, and it reports any
+    exit code other than 0 or 1 as a failed job. A managed scan (recognized by
+    SEMGREP_MANAGED_SCAN_ID) therefore keeps its previous exit code, with the
+    same flags and the same failing subproject as the regular CI scan.
+    """
+    subprojects = [
+        _unresolved("bad/build.gradle", out.UnresolvedFailed(), [_CMD_FAILED])
+    ]
+    mocker.patch.object(
+        semgrep.run_scan,
+        "resolve_dependencies",
+        return_value=(
+            [],
+            [e for sub in subprojects for e in sub.errors],
+            [],
+            subprojects,
+            {},
+        ),
+    )
+
+    create_scan_mock = start_scan_mock_maker("https://semgrep.dev")
+    complete_scan_mock_maker("https://semgrep.dev")
+    upload_results_mock_maker("https://semgrep.dev")
+
+    env = {"SEMGREP_APP_TOKEN": "fake-key-from-tests"}
+    if managed_scan_id:
+        env["SEMGREP_MANAGED_SCAN_ID"] = managed_scan_id
+
+    result = run_semgrep(
+        subcommand="ci",
+        options=["--no-suppress-errors", "--allow-local-builds", "--oss-only"],
+        target_name=None,
+        strict=False,
+        assert_exit_code=expected_exit_code,
+        env=env,
+        use_click_runner=True,
+    )
+
+    # The env var really reached the CLI: it is what the CLI tells the app.
+    assert (managed_scan_id is not None) == (
+        f'"sms_scan_id": "{managed_scan_id}"' in create_scan_mock.last_request.text
+    )
+    if expect_failure:
+        assert "Dependency resolution failed for 1 subproject" in result.stderr
+        assert "CI scan completed successfully" not in result.stderr
+    else:
+        assert "Dependency resolution failed" not in result.stderr
+        assert "CI scan completed successfully" in result.stderr
 
 
 @pytest.mark.osemfail
@@ -2674,6 +3315,8 @@ def test_reachable_and_unreachable_diff_scan_findings(
 
     findings_json = upload_results_mock.last_request.json()
     assert len(findings_json["findings"]) == 3
+    # Field should be absent when not in a diff scan
+    assert "changed_dependency_sources" not in findings_json
 
     pyfile1 = repo_copy_base / "foo.py"
     pyfile1.write_text(f"x = 2\n")
@@ -2712,6 +3355,312 @@ def test_reachable_and_unreachable_diff_scan_findings(
     )
     findings_json = upload_results_mock.last_request.json()
     assert len(findings_json["findings"]) == 1
+    # A diff scan that touched only a code file: dependencies are still
+    # resolved and uploaded, but no lockfile or manifest changed.
+    assert findings_json["changed_dependency_sources"] == []
+
+
+_REQUESTS_LOCKFILE_ENTRY = dedent(
+    """\
+
+    [[package]]
+    name = "requests"
+    version = "2.28.1"
+    description = "Python HTTP for Humans."
+    category = "main"
+    optional = false
+    python-versions = ">=3.7, <4"
+    """
+)
+
+# Shaped after the lodash entry the git fixture already writes to yarn.lock.
+_UNDERSCORE_YARN_ENTRY = dedent(
+    """\
+
+    underscore@1.13.6:
+      version "1.13.6"
+      resolved "https://registry.yarnpkg.com/underscore/-/underscore-1.13.6.tgz#5c5f072c5c02f386378dd3f6325b529376210427"
+      integrity sha512-au4L1q0HKcaaa37qOdpWWhwzDnB/taYJfRiKULnaT+Ml9UaBIjJ2SOJMeLtSeeLT+zUdyFMm0+ts+j4eeuUpIA==
+    """
+)
+
+# A dependency-aware rule is required for the CLI to resolve subprojects at all,
+# and enable_dependency_query is what puts the resolved dependencies on the
+# /results payload. Without both, `dependencies` would be empty and the
+# assertions about it would be vacuous.
+_SCA_SCAN_CONFIG = dedent(
+    """
+    rules:
+      - id: eqeq-bad
+        pattern: $X == $X
+        message: "useless comparison"
+        languages: [python]
+        severity: ERROR
+      - id: supply-chain1
+        message: "found a dependency"
+        languages: [python]
+        severity: ERROR
+        r2c-internal-project-depends-on:
+          namespace: pypi
+          package: badlib
+          version: == 99.99.99
+        metadata:
+          dev.semgrep.actions: [block]
+          sca-kind: upgrade-only
+    """
+).lstrip()
+
+
+@pytest.mark.parametrize("scan_config", [_SCA_SCAN_CONFIG], ids=["config"])
+@pytest.mark.parametrize("enable_dependency_query", [True])
+@pytest.mark.osemfail
+class TestChangedDependencySources:
+    """`changed_dependency_sources` is relative to each scan's own merge base.
+
+    It is used to communicate to the app which dependency sources were edited in
+    the diff scan. Subproject dependencies are resolved and uploaded regardless
+    so an empty list means no dependency sources were edited.
+    """
+
+    @staticmethod
+    def _git(*args: str) -> None:
+        subprocess.run(["git", *args], check=True, capture_output=True)
+
+    @staticmethod
+    def _head_sha() -> str:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], encoding="utf-8"
+        ).strip()
+
+    @classmethod
+    def _commit_new_poetry_dependency(cls, repo_base: Path) -> None:
+        lockfile = repo_base / "poetry.lock"
+        lockfile.write_text(lockfile.read_text() + _REQUESTS_LOCKFILE_ENTRY)
+        cls._git("add", ".")
+        cls._git("commit", "-m", "add requests to poetry.lock")
+
+    @classmethod
+    def _commit_new_yarn_dependency(cls, repo_base: Path) -> None:
+        lockfile = repo_base / "yarn.lock"
+        lockfile.write_text(lockfile.read_text() + _UNDERSCORE_YARN_ENTRY)
+        cls._git("add", ".")
+        cls._git("commit", "-m", "add underscore to yarn.lock")
+
+    @classmethod
+    def _commit_deleted_poetry_lockfile(cls, repo_base: Path) -> None:
+        (repo_base / "poetry.lock").unlink()
+        cls._git("add", "-A")
+        cls._git("commit", "-m", "delete poetry.lock")
+
+    @classmethod
+    def _commit_removed_poetry_dependency(cls, repo_base: Path) -> None:
+        """Undo `_commit_new_poetry_dependency`. Fails loudly if there is nothing to undo,
+        since `git commit` refuses an empty commit."""
+        lockfile = repo_base / "poetry.lock"
+        lockfile.write_text(lockfile.read_text().replace(_REQUESTS_LOCKFILE_ENTRY, ""))
+        cls._git("add", ".")
+        cls._git("commit", "-m", "remove requests from poetry.lock")
+
+    @classmethod
+    def _commit_code_edit(cls, repo_base: Path) -> None:
+        (repo_base / "foo.py").write_text("x == x\n")
+        cls._git("add", ".")
+        cls._git("commit", "-m", "edit code only")
+
+    @pytest.fixture
+    def upload_results_mock(
+        self, start_scan_mock_maker, complete_scan_mock_maker, upload_results_mock_maker
+    ):
+        start_scan_mock_maker("https://semgrep.dev")
+        complete_scan_mock_maker("https://semgrep.dev")
+        return upload_results_mock_maker("https://semgrep.dev")
+
+    @staticmethod
+    def _scan(
+        run_semgrep: RunSemgrep,
+        upload_results_mock,
+        baseline: Optional[str] = None,
+    ) -> Any:
+        """Run `semgrep ci`; return the uploaded /results body.
+
+        Passing `baseline` makes it a diff scan against that commit; omitting it
+        makes it a full scan.
+        """
+        options = ["--no-suppress-errors", "--oss-only"]
+        if baseline is not None:
+            options += ["--baseline-commit", baseline]
+        run_semgrep(
+            subcommand="ci",
+            options=options,
+            target_name=None,
+            strict=False,
+            assert_exit_code=None,
+            env={"SEMGREP_APP_TOKEN": "fake_key"},
+            use_click_runner=True,
+        )
+        return upload_results_mock.last_request.json()
+
+    @pytest.mark.slow
+    def test_lockfile_edit_reports_the_lockfile(
+        self,
+        git_tmp_path_with_commit,
+        run_semgrep: RunSemgrep,
+        upload_results_mock,
+    ):
+        """A branch that edits a lockfile reports that lockfile."""
+        repo_copy_base, main_commit, _branch_commit = git_tmp_path_with_commit
+
+        self._git("checkout", "-B", "branch-a", main_commit)
+        self._commit_new_poetry_dependency(repo_copy_base)
+
+        results = self._scan(run_semgrep, upload_results_mock, baseline=main_commit)
+        assert results["changed_dependency_sources"] == ["poetry.lock"]
+        assert results["dependencies"]
+
+    @pytest.mark.slow
+    def test_multiple_lockfile_edits_report_every_lockfile(
+        self,
+        git_tmp_path_with_commit,
+        run_semgrep: RunSemgrep,
+        upload_results_mock,
+    ):
+        """Every edited dependency source is reported, in alphabetical order."""
+        repo_copy_base, main_commit, _branch_commit = git_tmp_path_with_commit
+
+        self._git("checkout", "-B", "branch-a", main_commit)
+        self._commit_new_yarn_dependency(repo_copy_base)
+        self._commit_new_poetry_dependency(repo_copy_base)
+
+        results = self._scan(run_semgrep, upload_results_mock, baseline=main_commit)
+        assert results["changed_dependency_sources"] == ["poetry.lock", "yarn.lock"]
+        assert results["dependencies"]
+
+    @pytest.mark.slow
+    def test_deleted_lockfile_is_not_reported(
+        self,
+        git_tmp_path_with_commit,
+        run_semgrep: RunSemgrep,
+        upload_results_mock,
+    ):
+        """Deleting a lockfile outright is not reported as a changed source.
+
+        The field is derived from scan targets, and a deleted file is not a
+        target at HEAD, so its removal is invisible here even though it plainly
+        changes the project's dependencies. Pinned so the gap is deliberate: an
+        empty list means "no dependency source was added or modified", not
+        "the dependencies are unchanged".
+        """
+        repo_copy_base, main_commit, _branch_commit = git_tmp_path_with_commit
+
+        self._git("checkout", "-B", "branch-a", main_commit)
+        self._commit_deleted_poetry_lockfile(repo_copy_base)
+
+        results = self._scan(run_semgrep, upload_results_mock, baseline=main_commit)
+        assert results["changed_dependency_sources"] == []
+
+    @pytest.mark.slow
+    def test_stacked_no_change_branch_reports_no_changes(
+        self,
+        git_tmp_path_with_commit,
+        run_semgrep: RunSemgrep,
+        upload_results_mock,
+    ):
+        """A branch stacked on a dependency-adding branch reports no changes."""
+        repo_copy_base, main_commit, _branch_commit = git_tmp_path_with_commit
+
+        self._git("checkout", "-B", "branch-a", main_commit)
+        self._commit_new_poetry_dependency(repo_copy_base)
+        commit_a = self._head_sha()
+
+        results_a = self._scan(run_semgrep, upload_results_mock, baseline=main_commit)
+        assert results_a["changed_dependency_sources"] == ["poetry.lock"]
+
+        self._git("checkout", "-b", "branch-b")
+        self._commit_code_edit(repo_copy_base)
+
+        results_b = self._scan(run_semgrep, upload_results_mock, baseline=commit_a)
+        assert results_b["changed_dependency_sources"] == []
+        assert results_b["dependencies"]
+
+    @pytest.mark.slow
+    def test_dependency_already_merged_to_main_reports_no_changes(
+        self,
+        git_tmp_path_with_commit,
+        run_semgrep: RunSemgrep,
+        upload_results_mock,
+    ):
+        """A dependency already merged to main is not reported by later branches."""
+        repo_copy_base, main_commit, _branch_commit = git_tmp_path_with_commit
+
+        # Full scan of main, before the dependency exists.
+        self._git("checkout", "-B", MAIN_BRANCH_NAME, main_commit)
+        results_main = self._scan(run_semgrep, upload_results_mock)
+        assert "changed_dependency_sources" not in results_main
+
+        # Branch A adds the dependency, so its diff scan reports the lockfile.
+        self._git("checkout", "-b", "branch-a")
+        self._commit_new_poetry_dependency(repo_copy_base)
+
+        results_a = self._scan(run_semgrep, upload_results_mock, baseline=main_commit)
+        assert results_a["changed_dependency_sources"] == ["poetry.lock"]
+
+        # A merges into main. Main's own diff scan still sees the lockfile edit.
+        self._git("checkout", MAIN_BRANCH_NAME)
+        self._git("merge", "--ff-only", "branch-a")
+        main_with_dependency = self._head_sha()
+
+        results_merge = self._scan(
+            run_semgrep, upload_results_mock, baseline=main_commit
+        )
+        assert results_merge["changed_dependency_sources"] == ["poetry.lock"]
+
+        # Branch B is cut from the updated main and edits only code. No changes are reported.
+        self._git("checkout", "-b", "branch-b")
+        self._commit_code_edit(repo_copy_base)
+
+        results_b = self._scan(
+            run_semgrep, upload_results_mock, baseline=main_with_dependency
+        )
+        assert results_b["changed_dependency_sources"] == []
+        assert results_b["dependencies"]
+
+    @pytest.mark.slow
+    def test_stale_lockfile_not_reported_when_branch_did_not_edit_it(
+        self,
+        git_tmp_path_with_commit,
+        run_semgrep: RunSemgrep,
+        upload_results_mock,
+    ):
+        """A stale lockfile is not reported as changed if there were no edits to the dependency source."""
+
+        repo_copy_base, main_commit, _branch_commit = git_tmp_path_with_commit
+
+        # Main carries the dependency to begin with.
+        self._git("checkout", "-B", MAIN_BRANCH_NAME, main_commit)
+        self._commit_new_poetry_dependency(repo_copy_base)
+        main_with_dependency = self._head_sha()
+
+        # Branch A edits code only, leaving the lockfile untouched.
+        self._git("checkout", "-b", "branch-a", main_with_dependency)
+        self._commit_code_edit(repo_copy_base)
+
+        # Branch B drops the dependency and merges into main, so branch A now has a stale lockfile compared to main.
+        self._git("checkout", "-b", "branch-b", main_with_dependency)
+        self._commit_removed_poetry_dependency(repo_copy_base)
+        self._git("checkout", MAIN_BRANCH_NAME)
+        self._git("merge", "--ff-only", "branch-b")
+        main_without_dependency = self._head_sha()
+
+        self._git("checkout", "branch-a")
+
+        # A has a stale lockfile with the old dependency.
+        assert _REQUESTS_LOCKFILE_ENTRY in (repo_copy_base / "poetry.lock").read_text()
+
+        results_a = self._scan(
+            run_semgrep, upload_results_mock, baseline=main_without_dependency
+        )
+        assert results_a["changed_dependency_sources"] == []
+        assert results_a["dependencies"]
 
 
 @pytest.mark.parametrize(
@@ -3075,9 +4024,11 @@ def test_finding_suppressed_when_baseline_scan_fails(
         *,
         with_code_rules: bool = True,
         with_supply_chain: bool = False,
+        code_enabled: Optional[bool] = None,
         write_to_tr_cache: bool = True,
         fips_mode: bool,
         enable_transitive_reachability: Optional[bool] = None,
+        x_dependency_paths: bool = False,
         x_parmap: bool = False,
         run_symbol_analysis: bool = False,
         rpc_session: Optional[RpcSession] = None,
@@ -3107,9 +4058,11 @@ def test_finding_suppressed_when_baseline_scan_fails(
             disable_secrets_validation,
             with_code_rules=with_code_rules,
             with_supply_chain=with_supply_chain,
+            code_enabled=code_enabled,
             write_to_tr_cache=write_to_tr_cache,
             fips_mode=fips_mode,
             enable_transitive_reachability=enable_transitive_reachability,
+            x_dependency_paths=x_dependency_paths,
             x_parmap=x_parmap,
             run_symbol_analysis=run_symbol_analysis,
             rpc_session=rpc_session,
@@ -3267,9 +4220,11 @@ def test_baseline_scan_failures_suppress_per_rule_and_whole_file(
         *,
         with_code_rules: bool = True,
         with_supply_chain: bool = False,
+        code_enabled: Optional[bool] = None,
         write_to_tr_cache: bool = True,
         fips_mode: bool,
         enable_transitive_reachability: Optional[bool] = None,
+        x_dependency_paths: bool = False,
         x_parmap: bool = False,
         run_symbol_analysis: bool = False,
         rpc_session: Optional[RpcSession] = None,
@@ -3299,9 +4254,11 @@ def test_baseline_scan_failures_suppress_per_rule_and_whole_file(
             disable_secrets_validation,
             with_code_rules=with_code_rules,
             with_supply_chain=with_supply_chain,
+            code_enabled=code_enabled,
             write_to_tr_cache=write_to_tr_cache,
             fips_mode=fips_mode,
             enable_transitive_reachability=enable_transitive_reachability,
+            x_dependency_paths=x_dependency_paths,
             x_parmap=x_parmap,
             run_symbol_analysis=run_symbol_analysis,
             rpc_session=rpc_session,

@@ -103,6 +103,10 @@ type conf = {
   exclude_minified_files : bool;
       (** osemgrep-only: exclude scanning large files based on
           max_target_bytes, default true *)
+  exclude_binary_files : bool;
+      (** exclude scanning binary files, default true. Binary files are
+          defined as files that contain magic bytes matching their
+          extension. *)
   baseline_commit : string option;
   par_conf : Parallelism_config.t;
   num_jobs : int option;
@@ -156,3 +160,10 @@ val get_target_fpaths :
 (* internals used also in Find_targets_old.ml *)
 val get_reason_for_exclusion :
   Gitignore.selection_event list -> Semgrep_output_v1_t.skip_reason
+
+val drop_warnings : (string * Fpath.t) list -> string list
+(** [drop_warnings drops] renders the warnings for paths that could not be
+    filtered, given (cause, path) pairs. Emits one message per distinct cause,
+    naming the affected paths, so that one worker failure poisoning a whole
+    batch of paths does not produce a burst of near-identical warnings.
+    Exposed for testing. *)

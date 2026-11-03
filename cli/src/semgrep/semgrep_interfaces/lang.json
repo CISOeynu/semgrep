@@ -508,6 +508,25 @@
     "tags": []
   },
   {
+    "id": "objc",
+    "name": "Objective-C",
+    "keys": [
+      "objc",
+      "objectivec",
+      "objective-c"
+    ],
+    "maturity": "alpha",
+    "exts": [
+      ".m"
+    ],
+    "example_ext": null,
+    "excluded_exts": [],
+    "reverse_exts": null,
+    "shebangs": [],
+    "is_target_language": true,
+    "tags": []
+  },
+  {
     "id": "ocaml",
     "name": "OCaml",
     "keys": [
@@ -674,24 +693,6 @@
     ]
   },
   {
-    "id": "ql",
-    "name": "QL",
-    "keys": [
-      "ql"
-    ],
-    "maturity": "alpha",
-    "exts": [
-      ".ql",
-      ".qll"
-    ],
-    "example_ext": ".ql",
-    "excluded_exts": [],
-    "reverse_exts": null,
-    "shebangs": [],
-    "is_target_language": true,
-    "tags": []
-  },
-  {
     "id": "r",
     "name": "R",
     "keys": [
@@ -830,6 +831,7 @@
     "maturity": "ga",
     "exts": [
       ".tf",
+      ".tofu",
       ".hcl",
       ".tfvars"
     ],

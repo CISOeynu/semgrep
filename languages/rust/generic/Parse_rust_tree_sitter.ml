@@ -1425,9 +1425,8 @@ and map_binary_expression (env : env) (x : CST.binary_expression) : G.expr_kind
       let tok, op =
         match v2 with
         | `LTLT tok -> (token env tok, G.LSL) (* "<<" *)
-        (* According to https://doc.rust-lang.org/reference/expressions/operator-expr.html#arithmetic-and-logical-binary-operators: *)
-        (* "Arithmetic right shift on signed integer types, logical right shift on unsigned integer types." *)
-        | `GTGT tok -> (token env tok, G.LSR)
+        (* signed >>: ASR by default; see AST_generic.operator *)
+        | `GTGT tok -> (token env tok, G.ASR)
         (* ">>" *)
       in
       let v3 = map_expression env v3 in
@@ -1834,9 +1833,8 @@ and map_expression_except_range (env : env) (x : CST.expression_except_range) =
           | `BAREQ tok -> (G.BitOr, token env tok) (* "|=" *)
           | `HATEQ tok -> (G.BitXor, token env tok) (* "^=" *)
           | `LTLTEQ tok -> (G.LSL, token env tok) (* "<<=" *)
-          (* According to https://doc.rust-lang.org/reference/expressions/operator-expr.html#arithmetic-and-logical-binary-operators: *)
-          (* "Arithmetic right shift on signed integer types, logical right shift on unsigned integer types." *)
-          | `GTGTEQ tok -> (G.LSR, token env tok)
+          (* signed >>=: ASR by default; see AST_generic.operator *)
+          | `GTGTEQ tok -> (G.ASR, token env tok)
           (* ">>=" *)
         in
         let rhs = map_expression env v3 in
@@ -3878,7 +3876,7 @@ and map_use_clause (env : env) (x : CST.use_clause) use : G.directive list =
 and prepend_module_name (scope : G.dotted_ident) (modname : G.module_name) :
     G.module_name =
   match modname with
-  | DottedName modname -> G.DottedName (modname @ scope)
+  | DottedName modname -> G.DottedName (scope @ modname)
   | _ -> modname
 
 and prepend_scope (dir : G.directive) (scope : G.dotted_ident option) :

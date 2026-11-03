@@ -17,6 +17,7 @@ from dataclasses import field
 from pathlib import Path
 from typing import Dict
 from typing import Generator
+from typing import Iterable
 from typing import List
 from typing import Optional
 from typing import Tuple
@@ -46,6 +47,9 @@ class DependencyResolutionConfig:
     # download source code for each subproject's dependencies.
     download_dependency_source_code: bool
 
+    # Report Gradle dependencies separately for each module build file.
+    gradle_module_attribution: bool = False
+
     # Use only the experimental ocaml parsers. This may
     # produce different results from the python parsers. Note that ocaml parsers
     # may be used even when False when necessary for feature support or when
@@ -64,6 +68,12 @@ class DependencyResolutionConfig:
     # but it's here because attach_auxillary_sboms needs it when selecting
     # the head/ vs base/ SBOM directory during resolution.
     is_baseline_scan: bool = False
+
+    # If true, resolve only the subprojects whose ecosystem is evaluated by at
+    # least one of the rules being run, and skip the rest. Set for partial scans
+    # (see --x-partial-scan-rule-id), which run a restricted set of rules and so
+    # cannot produce a finding for any other ecosystem.
+    restrict_resolution_to_rule_ecosystems: bool = False
 
 
 # A classification of subprojects we use to deterine support for various features.
@@ -267,6 +277,129 @@ def subproject_to_stats(
         return _resolved_subproject_to_stats(sub)
     else:
         raise ValueError(f"Unexpected subproject type: {type(sub)}")
+
+
+def collect_skipped_subprojects(
+    subprojects: Iterable[Union[out.ResolvedSubproject, out.UnresolvedSubproject]],
+) -> List[out.SkippedSubproject]:
+    """
+    Select the subprojects that were deliberately left unresolved and describe
+    them for the app.
+
+    Only subprojects with the `skipped` unresolved reason are included: the app
+    uses this list to know which dependencies are missing from the reported set
+    by design (so it must not treat them as removed), which does not apply to
+    subprojects whose resolution was attempted and failed, or whose ecosystem we
+    do not support at all.
+    """
+    return [
+        out.SkippedSubproject(
+            root_dir=sub.info.root_dir,
+            dependency_sources=to_stats_output(sub.info.dependency_source),
+        )
+        for sub in subprojects
+        if isinstance(sub, out.UnresolvedSubproject)
+        and isinstance(sub.reason.value, out.UnresolvedSkipped)
+    ]
+
+
+# Resolution errors produced by the resolvers that run a package manager (or
+# that cannot run one, e.g. `MissingRequirement`). A subproject that was
+# resolved but carries one of these is known to have an incomplete dependency
+# list (e.g. a registry refused a request, or the package manager itself
+# reported unresolved dependencies). `ParseDependenciesFailed` is not included
+# because lockfile parsers report it too.
+_BUILD_SIDE_RESOLUTION_ERRORS = (
+    out.ResolutionCmdFailed_,
+    out.MissingRequirement,
+    out.ResourceInaccessible_,
+    out.IncompleteDependencyResolution_,
+)
+
+_RESOLUTION_ERROR_LABELS = {
+    out.UnsupportedManifest: "Unsupported Manifest",
+    out.MissingRequirement: "Missing Requirement",
+    out.ResolutionCmdFailed_: "Resolution Command Failed",
+    out.ParseDependenciesFailed: "Parsing Dependencies Failed",
+    out.ScaParseError: "Lockfile Parse Error",
+    out.IncompleteDependencyResolution_: "Incomplete Dependency Resolution",
+    out.ResourceInaccessible_: "Resource Inaccessible",
+}
+
+
+@dataclass(frozen=True)
+class ResolutionFailure:
+    """A subproject whose dependency resolution failed, or came back known to
+    be incomplete. See `find_resolution_failures`."""
+
+    dependency_sources: Tuple[Path, ...]
+    # Human-readable error kinds, in the order reported. Empty if resolution
+    # failed without reporting any error.
+    reasons: Tuple[str, ...]
+
+    def describe(self) -> str:
+        sources = ", ".join(str(p) for p in self.dependency_sources)
+        reasons = ", ".join(self.reasons) or "no error details were reported"
+        return f"{sources or '(unknown dependency source)'}: {reasons}"
+
+
+def _resolution_error_kind(error: out.ScaError) -> Optional[object]:
+    """The resolution error variant, or None for lockfile parser errors."""
+    if isinstance(error.value, out.SCAResol):
+        return error.value.value.type_.value
+    return None
+
+
+def _resolution_error_label(error: out.ScaError) -> str:
+    kind = _resolution_error_kind(error)
+    if kind is None:
+        return "Lockfile Parse Error"
+    return _RESOLUTION_ERROR_LABELS.get(type(kind), type(kind).__name__.rstrip("_"))
+
+
+def find_resolution_failures(
+    subprojects: Iterable[Union[out.ResolvedSubproject, out.UnresolvedSubproject]],
+) -> List[ResolutionFailure]:
+    """
+    Select the subprojects whose dependency resolution was attempted and
+    either failed or is known to be incomplete.
+
+    - An unresolved subproject counts if its reason is `failed`, even if no
+      error was reported (e.g. the RPC to the resolver crashed), unless every
+      reported error is `UnsupportedManifest`: that is a limitation of Semgrep,
+      not something the user can fix.
+    - A resolved subproject counts if it carries a build-side error (see
+      `_BUILD_SIDE_RESOLUTION_ERRORS`). Lockfile parse errors on a resolved
+      subproject (some dependencies were found) do not count.
+    - Subprojects that were never attempted (`skipped`, `unsupported`,
+      `disabled`) never count.
+    """
+    failures: List[ResolutionFailure] = []
+    for sub in subprojects:
+        if isinstance(sub, out.UnresolvedSubproject):
+            if not isinstance(sub.reason.value, out.UnresolvedFailed):
+                continue
+            kinds = [_resolution_error_kind(e) for e in sub.errors]
+            if kinds and all(isinstance(k, out.UnsupportedManifest) for k in kinds):
+                continue
+            reported = sub.errors
+        else:
+            reported = [
+                e
+                for e in sub.errors
+                if isinstance(_resolution_error_kind(e), _BUILD_SIDE_RESOLUTION_ERRORS)
+            ]
+            if not reported:
+                continue
+        failures.append(
+            ResolutionFailure(
+                dependency_sources=tuple(get_display_paths(sub.info.dependency_source)),
+                reasons=tuple(
+                    dict.fromkeys(_resolution_error_label(e) for e in reported)
+                ),
+            )
+        )
+    return failures
 
 
 def subproject_to_cli_output_info(

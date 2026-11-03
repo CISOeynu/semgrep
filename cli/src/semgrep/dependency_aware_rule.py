@@ -14,6 +14,7 @@ import dataclasses
 import json
 import os
 from collections import defaultdict
+from collections import deque
 from functools import lru_cache
 from pathlib import Path
 from tempfile import mkstemp
@@ -24,6 +25,7 @@ from typing import List
 from typing import Optional
 from typing import Tuple
 
+import attr
 from attr import dataclass
 from attr import evolve
 
@@ -31,12 +33,17 @@ import semgrep.rpc_call as rpc_call
 import semgrep.semgrep_interfaces.semgrep_output_v1 as out
 from semdep.external.packaging.specifiers import InvalidSpecifier  # type: ignore
 from semdep.external.packaging.specifiers import SpecifierSet  # type: ignore
+from semdep.matchers.gradle import GradleMatcher
 from semdep.package_restrictions import dependencies_range_match_any
+from semdep.package_restrictions import dependency_match_key
 from semdep.package_restrictions import is_in_range
+from semdep.package_restrictions import is_unpinned_version
+from semgrep.dependency_path import DependencyParentIndex
 from semgrep.error import SemgrepError
 from semgrep.rpc import RpcSession
 from semgrep.rule import Rule
 from semgrep.rule_match import RuleMatch
+from semgrep.sca_subproject_support import GRADLE_MODULE_ATTRIBUTION_SUBPROJECT_KINDS
 from semgrep.sca_subproject_support import TRANSITIVE_REACHABILITY_SUBPROJECT_KINDS
 from semgrep.semgrep_interfaces.semgrep_output_v1 import Ecosystem
 from semgrep.semgrep_interfaces.semgrep_output_v1 import Pypi
@@ -97,6 +104,153 @@ def parse_depends_on_yaml(entries: List[Dict[str, str]]) -> Iterator[out.ScaPatt
 
 
 @dataclass
+class GradleModuleIndex:
+    """
+    The dependencies of a Gradle subproject grouped by the module build file
+    they were reported from, used to scope reachable findings to the module
+    that contains the matching code.
+
+    With gradle_module_attribution on, the resolver reports each module's
+    dependencies at that module's build file (`lockfile_path`), mapping a Gradle
+    project path such as `:services:api` to the conventional
+    `<root>/services/api/build.gradle[.kts]`. This index applies the same
+    convention to source files: a file belongs to the nearest enclosing
+    directory, up to the subproject root, that holds a Gradle build file. A
+    module the resolver could not map to a build file (remapped `projectDir`,
+    or no build file of its own) is reported at the root manifest, so both its
+    dependencies and its code fall back to the root module. Preserving module
+    identity in those cases is tracked separately (SC-4026).
+    """
+
+    root_dir: Path
+    # Where the resolver reports dependencies of modules without a build file
+    manifest_path: Path
+    deps_by_build_file: Dict[Path, List[out.FoundDependency]]
+    deps_by_key: Dict[Tuple[str, str], List[out.FoundDependency]]
+    _build_file_cache: Dict[Path, Optional[Path]] = attr.ib(factory=dict)
+
+    @classmethod
+    def from_subproject(
+        cls, subproject: out.ResolvedSubproject, deps: List[out.FoundDependency]
+    ) -> Optional["GradleModuleIndex"]:
+        """
+        None unless the subproject is a Gradle build whose dependencies the
+        resolver reports per module: a build file with no lockfile. A Gradle
+        build resolved from an SBOM or a lockfile keeps the package-level view.
+        """
+        dependency_source = subproject.info.dependency_source.value
+        if not isinstance(dependency_source, out.ManifestOnly) or (
+            (dependency_source.value.kind, None)
+            not in GRADLE_MODULE_ATTRIBUTION_SUBPROJECT_KINDS
+        ):
+            return None
+        deps_by_build_file: Dict[Path, List[out.FoundDependency]] = defaultdict(list)
+        deps_by_key: Dict[Tuple[str, str], List[out.FoundDependency]] = defaultdict(
+            list
+        )
+        for dep in deps:
+            if dep.lockfile_path is None:
+                continue
+            deps_by_build_file[Path(dep.lockfile_path.value)].append(dep)
+            deps_by_key[(dep.package, dep.version)].append(dep)
+        return cls(
+            root_dir=Path(subproject.info.root_dir.value),
+            manifest_path=Path(dependency_source.value.path.value),
+            deps_by_build_file=dict(deps_by_build_file),
+            deps_by_key=dict(deps_by_key),
+        )
+
+    def _build_file_in(self, directory: Path) -> Optional[Path]:
+        if directory not in self._build_file_cache:
+            self._build_file_cache[directory] = next(
+                (
+                    candidate
+                    for candidate in (
+                        directory / name for name in GradleMatcher.BUILD_FILENAMES
+                    )
+                    if candidate in self.deps_by_build_file or candidate.is_file()
+                ),
+                None,
+            )
+        return self._build_file_cache[directory]
+
+    def module_build_file(self, path: Path) -> Path:
+        """
+        The build file of the module that owns the source file at `path`: the
+        nearest Gradle build file in its directory or an enclosing one, up to
+        the subproject root. A build file counts even when the module has no
+        resolved dependencies, so root dependencies do not leak into it. Files
+        under no build file belong to the root manifest.
+        """
+        directory = path.parent
+        while True:
+            build_file = self._build_file_in(directory)
+            if build_file is not None:
+                return build_file
+            if directory == self.root_dir or directory == directory.parent:
+                return self.manifest_path
+            directory = directory.parent
+
+    def applicable_dependencies(
+        self, path: Path
+    ) -> Tuple[List[out.FoundDependency], List[out.FoundDependency]]:
+        """
+        The dependencies code in `path` can use, as two lists: the owning
+        module's own dependencies, then dependencies declared by other modules
+        and reached through an explicit Gradle project dependency
+        (app -> project(":lib") -> lib's dependencies).
+
+        The resolver keeps a project dependency as a node in the consuming
+        module whose children live in the module it points to, so following
+        `children` across build files recovers those dependencies. Each child
+        names the build file of the instance it refers to. A child without one
+        (older resolver output) resolves to the same module's copy when there
+        is one, otherwise to every module's copy.
+
+        Two project dependencies can bring in the same package and version
+        from two modules (app -> lib and app -> lib2, both using Guava). For
+        the code in `path` those copies are interchangeable, so only the first
+        one reached is reported: one code match must not turn into several
+        reachable findings with the same finding ID. The other copies still
+        get their own dependency-only findings. Every copy is still traversed,
+        because the same package can resolve to different children in
+        different modules.
+        """
+        own = self.deps_by_build_file.get(self.module_build_file(path), [])
+        via_project_dependencies: List[out.FoundDependency] = []
+        seen = {id(dep) for dep in own}
+        reached: set[Tuple[str, str]] = {(dep.package, dep.version) for dep in own}
+        queue = deque(own)
+        while queue:
+            dep = queue.popleft()
+            for child in dep.children or []:
+                instances = self.deps_by_key.get((child.package, child.version), [])
+                if child.lockfile_path is not None:
+                    referenced = [
+                        instance
+                        for instance in instances
+                        if instance.lockfile_path == child.lockfile_path
+                    ]
+                else:
+                    same_module = [
+                        instance
+                        for instance in instances
+                        if instance.lockfile_path == dep.lockfile_path
+                    ]
+                    referenced = same_module or instances
+                for instance in referenced:
+                    if id(instance) in seen:
+                        continue
+                    seen.add(id(instance))
+                    queue.append(instance)
+                    key = (instance.package, instance.version)
+                    if key not in reached:
+                        reached.add(key)
+                        via_project_dependencies.append(instance)
+        return own, via_project_dependencies
+
+
+@dataclass
 class SubprojectDependencyIndex:
     """
     an index to efficiently find version matches within a subproject
@@ -107,19 +261,35 @@ class SubprojectDependencyIndex:
 
     index: dict[str, list[out.FoundDependency]]
     num_deps: int
+    # the flat list of dependencies, in resolution order
+    deps: list[out.FoundDependency]
+    # the same dependencies grouped by Gradle module build file; only built
+    # when gradle_module_attribution is on, and None for subprojects the
+    # resolver never reports per module
+    gradle_modules: Optional[GradleModuleIndex] = None
 
     @classmethod
     @simple_profiling
     def from_subproject(
-        cls, subproject: out.ResolvedSubproject
+        cls,
+        subproject: out.ResolvedSubproject,
+        gradle_module_attribution: bool = False,
     ) -> "SubprojectDependencyIndex":
+        deps = list(iter_found_dependencies(subproject.resolved_dependencies))
         subproject_index: dict[str, list[out.FoundDependency]] = defaultdict(list)
-        num_deps = 0
-        for dependency in iter_found_dependencies(subproject.resolved_dependencies):
-            subproject_index[dependency.package].append(dependency)
-            num_deps += 1
+        for dependency in deps:
+            subproject_index[
+                dependency_match_key(dependency.ecosystem, dependency.package)
+            ].append(dependency)
 
-        return cls(subproject_index, num_deps)
+        return cls(
+            subproject_index,
+            len(deps),
+            deps,
+            GradleModuleIndex.from_subproject(subproject, deps)
+            if gradle_module_attribution
+            else None,
+        )
 
     def get_dependency_matches(
         self, sca_patterns: list[out.ScaPattern]
@@ -128,11 +298,13 @@ class SubprojectDependencyIndex:
         Yields matches to the given sca patterns using the index to compute them.
         """
         for pattern in sca_patterns:
-            candidates = self.index.get(pattern.package, [])
+            key = dependency_match_key(pattern.ecosystem, pattern.package)
+            candidates = self.index.get(key, [])
             for candidate in candidates:
                 if (
                     pattern.ecosystem == candidate.ecosystem
-                    and pattern.package == candidate.package
+                    and dependency_match_key(candidate.ecosystem, candidate.package)
+                    == key
                     and is_in_range(
                         pattern.ecosystem, pattern.semver_range, candidate.version
                     )
@@ -153,6 +325,7 @@ def generate_unreachable_sca_findings(
     fips_mode: bool,
     write_to_tr_cache: bool = True,
     rpc_session: Optional[RpcSession] = None,
+    parent_indexes: Optional[Dict[int, DependencyParentIndex]] = None,
 ) -> Tuple[List[RuleMatch], List[SemgrepError]]:
     """
     Returns matches to a only a rule's sca-depends-on patterns;
@@ -167,6 +340,9 @@ def generate_unreachable_sca_findings(
     errors: List[SemgrepError] = []
     depends_on_entries = list(parse_depends_on_yaml(rule.project_depends_on))
     ecosystems = list(rule.ecosystems)
+    # only populated when --x-dependency-paths is on (see run_scan); a present
+    # entry is the signal to emit paths for that subproject.
+    parent_indexes = parent_indexes or {}
 
     non_reachable_matches: List[RuleMatch] = []
     match_based_keys: Dict[tuple[str, Path, str], int] = defaultdict(int)
@@ -177,6 +353,7 @@ def generate_unreachable_sca_findings(
             subproject_kind = dep_source_to_subproject_kind(
                 subproject.info.dependency_source
             )
+            parent_index = parent_indexes.get(id(subproject))
             subproject_matches: List[RuleMatch] = []
 
             dependency_matches: List[Tuple[out.ScaPattern, out.FoundDependency]] = list(
@@ -204,6 +381,9 @@ def generate_unreachable_sca_findings(
                     dependency_pattern=dep_pat,
                     found_dependency=found_dep,
                     lockfile=found_dep.lockfile_path,
+                    dependency_paths=(parent_index.paths_for(found_dep) or None)
+                    if parent_index is not None
+                    else None,
                 )
                 sca_match = out.ScaMatch(
                     sca_finding_schema=SCA_FINDING_SCHEMA,
@@ -323,45 +503,117 @@ def transitive_dep_is_also_direct(
 def generate_reachable_sca_findings(
     matches: List[RuleMatch],
     rule: Rule,
-    resolved_deps: Dict[Ecosystem, List[out.ResolvedSubproject]],
+    dependency_index: dict[
+        Ecosystem, list[tuple[out.ResolvedSubproject, SubprojectDependencyIndex]]
+    ],
+    parent_indexes: Optional[Dict[int, DependencyParentIndex]] = None,
+    gradle_module_attribution: bool = False,
 ) -> Tuple[
     List[RuleMatch], List[SemgrepError], Callable[[Path, out.FoundDependency], bool]
 ]:
+    """
+    Turn the rule's code matches into reachable findings by pairing each one
+    with the matching dependencies of the subproject that contains it.
+
+    Also returns a predicate telling whether a dependency was paired with some
+    code match, so that no dependency-only finding is reported for it.
+
+    :param gradle_module_attribution: the resolver reported Gradle dependencies
+        per module build file, so a code match only pairs with dependencies
+        applicable to its own module (see GradleModuleIndex).
+    """
     errors: List[SemgrepError] = []
     depends_on_entries = list(parse_depends_on_yaml(rule.project_depends_on))
     ecosystems = list(rule.ecosystems)
+    # only populated when --x-dependency-paths is on (see run_scan); a present
+    # entry is the signal to emit paths for that subproject.
+    parent_indexes = parent_indexes or {}
 
     # Reachability rule
     reachable_matches: List[RuleMatch] = []
     reachable_deps = set()
     for ecosystem in ecosystems:
+        # The per-subproject index (carrying the flat deps) is built once for
+        # the whole scan in run_scan and reused here, rather than rebuilt per
+        # rule. We index it by subproject identity to look it back up after
+        # matching a code finding's path (same keying as parent_indexes).
+        subproject_entries = dependency_index.get(ecosystem, [])
+        subprojects = [subproject for subproject, _ in subproject_entries]
+        index_by_subproject = {
+            id(subproject): subproject_index
+            for subproject, subproject_index in subproject_entries
+        }
         for rule_match in matches:
             try:
                 subproject = find_closest_resolved_subproject(
-                    rule_match.path, ecosystem, resolved_deps.get(ecosystem, [])
+                    rule_match.path, ecosystem, subprojects
                 )
                 if subproject is None:
                     continue
 
-                deps: List[out.FoundDependency] = list(
-                    iter_found_dependencies(subproject.resolved_dependencies)
-                )
+                subproject_index = index_by_subproject[id(subproject)]
+                parent_index = parent_indexes.get(id(subproject))
 
+                module_index = (
+                    subproject_index.gradle_modules
+                    if gradle_module_attribution
+                    else None
+                )
+                if module_index is not None:
+                    # The module's own dependencies come first. Dependencies
+                    # reached through a project dependency on another module
+                    # only count when none of the module's own match.
+                    candidate_deps = list(
+                        module_index.applicable_dependencies(rule_match.path)
+                    )
+                else:
+                    candidate_deps = [subproject_index.deps]
+
+                deps: List[out.FoundDependency] = []
                 dependency_matches: List[
                     Tuple[out.ScaPattern, out.FoundDependency]
-                ] = list(dependencies_range_match_any(depends_on_entries, deps))
+                ] = []
+                for deps in candidate_deps:
+                    dependency_matches = list(
+                        dependencies_range_match_any(depends_on_entries, deps)
+                    )
+                    if dependency_matches:
+                        break
 
                 pattern_deps = set(
-                    dep_pattern.package for dep_pattern in depends_on_entries
+                    dependency_match_key(dep_pattern.ecosystem, dep_pattern.package)
+                    for dep_pattern in depends_on_entries
                 )
 
-                # This list will be non-empty if any of the dependencies the rule searches for are present as direct dependencies
-                rule_could_match_direct_deps = [
-                    found_dep.package
+                # The packages the rule searches for that are present as direct
+                # dependencies, whatever their version. Presence alone is the
+                # signal for the heuristic below: a direct `foo` means the code
+                # most likely uses `foo`, not a transitive `foo-special`.
+                # It only looks at the same dependencies the matches came from,
+                # so with Gradle module attribution a direct copy in another
+                # module does not suppress this module's transitive copy.
+                direct_pattern_packages = {
+                    dependency_match_key(found_dep.ecosystem, found_dep.package)
                     for found_dep in deps
-                    if found_dep.package in pattern_deps
+                    if dependency_match_key(found_dep.ecosystem, found_dep.package)
+                    in pattern_deps
                     and found_dep.transitivity.value == out.Direct()
-                ]
+                }
+                # The subset whose direct copy names a definitive installed
+                # version. A direct dependency with no pinned version (see
+                # is_unpinned_version) cannot itself be what the rule matched,
+                # so it must not suppress a match on a pinned transitive copy
+                # of the same package. Otherwise adding `foo>=2.0` to
+                # requirements.txt would hide a reachable finding on a
+                # vulnerable transitive `foo` that was reported before.
+                pinned_direct_pattern_packages = {
+                    dependency_match_key(found_dep.ecosystem, found_dep.package)
+                    for found_dep in deps
+                    if dependency_match_key(found_dep.ecosystem, found_dep.package)
+                    in pattern_deps
+                    and found_dep.transitivity.value == out.Direct()
+                    and not is_unpinned_version(found_dep.version)
+                }
 
                 for dep_pat, found_dep in dependency_matches:
                     if found_dep.lockfile_path is None:
@@ -403,9 +655,18 @@ def generate_reachable_sca_findings(
                     # In the case where our dependency match is on a transitive, but one of the dependencies the rule searches for is
                     # present as a direct dependency, we skip this dependency match.
                     # This does not handle the case `foo` and `foo-special` are both direct dependencies
-                    if (
-                        found_dep.transitivity.value == out.Transitive()
-                        and rule_could_match_direct_deps
+                    # A direct copy of the matched package itself only counts
+                    # when it is pinned; a direct copy of any other package the
+                    # rule searches for counts whatever its version.
+                    found_key = dependency_match_key(
+                        found_dep.ecosystem, found_dep.package
+                    )
+                    other_direct_pattern_packages = direct_pattern_packages - {
+                        found_key
+                    }
+                    if found_dep.transitivity.value == out.Transitive() and (
+                        found_key in pinned_direct_pattern_packages
+                        or other_direct_pattern_packages
                     ):
                         continue
 
@@ -421,6 +682,9 @@ def generate_reachable_sca_findings(
                         dependency_pattern=dep_pat,
                         found_dependency=found_dep,
                         lockfile=found_dep.lockfile_path,
+                        dependency_paths=(parent_index.paths_for(found_dep) or None)
+                        if parent_index is not None
+                        else None,
                     )
                     sca_match = out.ScaMatch(
                         sca_finding_schema=SCA_FINDING_SCHEMA,

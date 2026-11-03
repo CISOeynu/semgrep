@@ -28,6 +28,7 @@ type t =
 | Lua
 | Move_on_sui
 | Move_on_aptos
+| Objc
 | Ocaml
 | Php
 | Powershell
@@ -36,7 +37,6 @@ type t =
 | Python2
 | Python3
 | Python
-| Ql
 | R
 | Ruby
 | Rust
@@ -432,6 +432,19 @@ let list = [
   tags = [];
 };
 {
+  id = Objc;
+  id_string = "objc";
+  name = "Objective-C";
+  keys = [{|objc|}; {|objectivec|}; {|objective-c|}];
+  exts = [{|.m|}];
+  maturity = Alpha;
+  example_ext = None;
+  excluded_exts = [];
+  reverse_exts = None;
+  shebangs = [];
+  tags = [];
+};
+{
   id = Ocaml;
   id_string = "ocaml";
   name = "OCaml";
@@ -536,19 +549,6 @@ let list = [
   tags = [{|is_python|}];
 };
 {
-  id = Ql;
-  id_string = "ql";
-  name = "QL";
-  keys = [{|ql|}];
-  exts = [{|.ql|}; {|.qll|}];
-  maturity = Alpha;
-  example_ext = Some {|.ql|};
-  excluded_exts = [];
-  reverse_exts = None;
-  shebangs = [];
-  tags = [];
-};
-{
   id = R;
   id_string = "r";
   name = "R";
@@ -644,7 +644,7 @@ let list = [
   id_string = "terraform";
   name = "Terraform";
   keys = [{|tf|}; {|hcl|}; {|terraform|}];
-  exts = [{|.tf|}; {|.hcl|}; {|.tfvars|}];
+  exts = [{|.tf|}; {|.tofu|}; {|.hcl|}; {|.tfvars|}];
   maturity = Ga;
   example_ext = None;
   excluded_exts = [];

@@ -13,24 +13,21 @@
 import asyncio
 import collections
 import contextlib
+import heapq
 import json
 import logging
+import math
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 from datetime import datetime
-from itertools import accumulate
-from itertools import pairwise
 from pathlib import Path
 from typing import Any
 from typing import Callable
 from typing import cast
 from typing import Coroutine
 from typing import Dict
-from typing import IO
-from typing import Iterable
 from typing import List
 from typing import Optional
 from typing import Sequence
@@ -83,28 +80,62 @@ from semgrep.verbose_logging import getLogger
 
 logger = getLogger(__name__)
 
-# Sharding pays an extra fixed cost when core has only one worker, so keep
-# small scans and runs without explicit --jobs on the historical single-file
-# path.
+# Sharding costs a fixed amount per file, so keep small scans single-file --
+# but only when they are small in bytes too, since a few enormous rules are
+# what the byte budget below exists to bound.
 RULE_FILE_SHARD_MIN_RULES = 128
 
+# Target serialized size of one shard. Parsing holds a large multiple of a
+# shard's bytes as live heap and major-GC work scales with the live set, so
+# capping shard size caps both peak memory and parse time. Measured optimum on
+# a 10,240-rule / 114MiB ruleset; smaller shards were slower but did keep
+# lowering peak memory.
+RULE_FILE_SHARD_TARGET_BYTES = 2 * 1024 * 1024
 
-def _shard_count(rules: int, jobs: Optional[int]) -> int:
-    if rules < RULE_FILE_SHARD_MIN_RULES:
+# Backstop on shard count. Shards are written and closed one at a time, so fds
+# do not bound this; the command line does, at ~80 chars per `-rules <path>`
+# against Windows' 32767 limit. Beyond this shards just exceed the target,
+# which degrades gracefully.
+RULE_FILE_SHARD_MAX_COUNT = 256
+
+
+def _shard_count(rules: int, jobs: Optional[int], total_bytes: int) -> int:
+    """Pick how many files to split the serialized ruleset across."""
+    if rules < RULE_FILE_SHARD_MIN_RULES and total_bytes <= (
+        RULE_FILE_SHARD_TARGET_BYTES
+    ):
         return 1
-    if jobs is None or jobs <= 1:
+    # An explicit `--jobs 1` really does mean a single domain in core. Anything
+    # else runs multicore and benefits from sharding -- including no `--jobs`
+    # at all, where we pass no `-j` and core picks its own domain count.
+    if jobs is not None and jobs <= 1:
         return 1
-    return min(rules, jobs)
+    size_based = math.ceil(total_bytes / RULE_FILE_SHARD_TARGET_BYTES)
+    jobs_floor = min(rules, jobs) if jobs is not None else 1
+    return max(1, min(rules, RULE_FILE_SHARD_MAX_COUNT, max(jobs_floor, size_based)))
 
 
-def _shard_rules(rules: Sequence[Rule], shard_count: int) -> Iterable[Sequence[Rule]]:
-    base_size, remainder = divmod(len(rules), shard_count)
-    shard_sizes = [
-        base_size + (1 if shard_index < remainder else 0)
-        for shard_index in range(shard_count)
-    ]
-    offsets = [0, *accumulate(shard_sizes)]
-    return [rules[start:end] for start, end in pairwise(offsets)]
+def _shard_rules(sizes: Sequence[int], shard_count: int) -> List[List[int]]:
+    """Partition rule indices into `shard_count` shards of even serialized size.
+
+    Balances by bytes, not rule count: heavy rules cluster, so equal-count
+    slices leave one shard well above the median and the parse phase finishes
+    no sooner than its largest shard. A shard cannot be smaller than its
+    largest rule, so this evens shards out rather than bounding them.
+
+    Rule order is preserved within a shard but not across them; concatenating
+    the shards no longer reproduces the original order.
+    """
+    if shard_count <= 1:
+        return [list(range(len(sizes)))]
+    shards: List[List[int]] = [[] for _ in range(shard_count)]
+    # (bytes assigned so far, shard index); the index keeps ties deterministic.
+    heap = [(0, shard_index) for shard_index in range(shard_count)]
+    for index in sorted(range(len(sizes)), key=lambda i: (-sizes[i], i)):
+        assigned, shard_index = heapq.heappop(heap)
+        shards[shard_index].append(index)
+        heapq.heappush(heap, (assigned + sizes[index], shard_index))
+    return [sorted(shard) for shard in shards]
 
 
 # Size in bytes of the input buffer for reading analysis outputs.
@@ -341,8 +372,6 @@ class StreamingSemgrepCore:
                     contact us.
 
                        Error: semgrep-core exited with unexpected output
-
-                       {self._stderr}
                     """,
                 )
 
@@ -465,7 +494,12 @@ class StreamingSemgrepCore:
         # Raise any exceptions from processing stdout/err
         for r in results:
             if isinstance(r, Exception):
-                raise SemgrepError(f"Error while running rules: {r}")
+                # wait until after we have finished gathering stderr before
+                # sticking it in the error. Previously we had it in the "You are
+                # seeing this because the engine was killed." but that relied on
+                # the async io reader to have read before we got to that point,
+                # which in practice never happened
+                raise SemgrepError(f"Error while running rules: {r}\n{self._stderr}")
 
     async def _stream_exec_subprocess(self) -> int:
         """
@@ -775,73 +809,6 @@ class CoreRunner:
             f"Error while matching: {reason}\n{details}{PLEASE_FILE_ISSUE_TEXT}"
         )
 
-    def _check_ddprof_preconditions(self) -> bool:
-        """
-        Checks if ddprof can be used for SMS profiling.
-        Returns True if ddprof can be used, False otherwise.
-
-        We want to add these checks because ddprof gives really weird errors
-        (e.g. exit code 2, sometimes even presents itself as other errors)
-        when it is ran without a proper setup.
-
-        The setup that ddprof needs is:
-        - We are running inside SMS
-        - DDPROF_ON, DD_ENV, DD_AGENT_HOST, and DD_SERVICE are set
-        - CAP_PERFMON is set
-        - trace is enabled
-        """
-        if not os.environ.get("SEMGREP_MANAGED_SCAN"):
-            return False
-
-        trace_enabled = self._trace
-        ddprof_on_path = shutil.which("ddprof")
-        ddprof_env_vars_set = (
-            os.environ.get("DDPROF_ON", "") != ""
-            and os.environ.get("DD_ENV", "") != ""
-            and os.environ.get("DD_AGENT_HOST", "") != ""
-            and os.environ.get("DD_SERVICE", "") != ""
-        )
-        ddprof_cap_set = False
-        # run ddprof -U 0:0 git --version and check for exitcode to make sure CAP_PERFMON is set.
-        #
-        # note: we are doing -U 0:0 because it ensures that the data of this dummy call is not sent anywhere.
-        try:
-            result = subprocess.run(
-                ["ddprof", "-U", "0:0", "git", "--version"], capture_output=True
-            )
-            if result.stdout and len(result.stdout.splitlines()) == 1:
-                ddprof_cap_set = True
-        except Exception as e:
-            logger.debug(f"Failed to check ddprof CAP_PERFMON: {e}")
-
-        ddprof = (
-            (ddprof_on_path is not None)
-            and trace_enabled
-            and ddprof_env_vars_set
-            and ddprof_cap_set
-        )
-
-        # debug message for ddprof
-        if not ddprof:
-            reasons = []
-            if ddprof_on_path is None:
-                reasons.append("ddprof is not in PATH")
-            if not trace_enabled:
-                reasons.append("trace is not enabled")
-            if not ddprof_env_vars_set:
-                reasons.append(
-                    "DDPROF_ON, DD_ENV, DD_AGENT_HOST, and DD_SERVICE are not set"
-                )
-            if not ddprof_cap_set:
-                reasons.append("CAP_PERFMON is not set")
-            if reasons:
-                logger.debug(
-                    "ddprof will not be used for SMS profiling. Reason(s): "
-                    + "; ".join(reasons)
-                    + "."
-                )
-        return ddprof
-
     def _check_pyro_caml_preconditions(self) -> bool:
         """
         Checks if pyro-caml can be used for profiling.
@@ -993,27 +960,24 @@ class CoreRunner:
 
         exit_stack = contextlib.ExitStack()
 
-        # Rule sharding
-        def f_for_shard(shard: int) -> IO[str]:
-            f: IO[str]
+        # The dumped rule files persist for inspection, and the shard count now
+        # varies by ruleset, so clear the previous run's before writing.
+        if dump_command_for_core:
+            for stale in state.env.user_data_folder.glob("semgrep_rules_*.json"):
+                stale.unlink()
+
+        # Written and closed one at a time: core reads shards back by path, so
+        # holding a handle each would put the shard count under RLIMIT_NOFILE.
+        def write_shard(shard: int, body: str) -> str:
             if dump_command_for_core:
-                fn = f"semgrep_rules_{shard}.json"
-                f = (state.env.user_data_folder / fn).open("w")
-            else:
-                f = tempfile.NamedTemporaryFile("w+", suffix=".json", encoding="utf-8")
-            return exit_stack.enter_context(f)
-
-        num_shards = _shard_count(len(rules), self._jobs)
-        rule_files = [f_for_shard(i) for i in range(num_shards)]
-
-        # A historical scan does not create a targeting file since targeting is
-        # performed directly by core.
-        if not target_mode_config.is_historical_scan:
-            target_file = exit_stack.enter_context(
-                (state.env.user_data_folder / "semgrep_targets.txt").open("w+")
-                if dump_command_for_core
-                else tempfile.NamedTemporaryFile("w+")
-            )
+                path = state.env.user_data_folder / f"semgrep_rules_{shard}.json"
+                path.write_text(body, encoding="utf-8")
+                return str(path)
+            fd, name = tempfile.mkstemp(suffix=".json")
+            exit_stack.callback(os.unlink, name)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(body)
+            return name
 
         with exit_stack:
             if self._binary_path is None:
@@ -1034,7 +998,15 @@ Could not find the semgrep-core executable. Your Semgrep install is likely corru
                     )
                 sys.exit(2)
 
-            use_ddprof = self._check_ddprof_preconditions()
+            # A historical scan does not create a targeting file since
+            # targeting is performed directly by core.
+            if not target_mode_config.is_historical_scan:
+                target_file = exit_stack.enter_context(
+                    (state.env.user_data_folder / "semgrep_targets.txt").open("w+")
+                    if dump_command_for_core
+                    else tempfile.NamedTemporaryFile("w+")
+                )
+
             use_pyro_caml = self._check_pyro_caml_preconditions()
             if use_pyro_caml:
                 state.telemetry.setup_pyro_caml()
@@ -1045,36 +1017,52 @@ Could not find the semgrep-core executable. Your Semgrep install is likely corru
                 # Optional values to strings. Make sure to check against None
                 # even though mypy won't warn you.
                 *(["pyro-caml", "-vv"] if use_pyro_caml else []),
-                *(["ddprof"] if use_ddprof else []),
                 str(self._binary_path),
                 "-json",
             ]
 
-            def dumps(rules: Iterable[Rule]) -> str:
-                # Compact JSON on the hot path; pretty-printed only when the
-                # caller has opted into --matching-explanations, which exposes
-                # `loc` blocks pointing into this file. Pretty-printing keeps
-                # the reported line/col numbers human-meaningful (and snapshot
-                # tests stable).
-                return json.dumps(
-                    {"rules": [rule._raw for rule in rules]},
-                    # TODO: sort object key order on the OCaml side so we can
-                    # drop sort_keys here. (See core_output.py where
-                    # match.extra.metadata, emitted by semgrep-core in input
-                    # order, replaces inner dicts via dict.update.)
-                    sort_keys=True,
-                    indent=2 if matching_explanations else None,
-                    separators=None if matching_explanations else (",", ":"),
-                )
+            # Sharding works in bytes, so every rule is serialized here to
+            # measure it. Compact blobs are also the shard bodies (joined
+            # below), so they are kept; indented ones cannot be concatenated,
+            # so that path measures and discards, and `dumps` re-serializes
+            # whole shards. len() is a byte count: json.dumps escapes
+            # non-ASCII.
+            #
+            # TODO: sort object key order on the OCaml side so we can drop
+            # sort_keys here. (See core_output.py where match.extra.metadata,
+            # emitted by semgrep-core in input order, replaces inner dicts via
+            # dict.update.)
+            rule_blobs: List[str] = []
+            if matching_explanations:
+                rule_sizes = [
+                    len(json.dumps(rule._raw, sort_keys=True, indent=2))
+                    for rule in rules
+                ]
+            else:
+                rule_blobs = [
+                    json.dumps(rule._raw, sort_keys=True, separators=(",", ":"))
+                    for rule in rules
+                ]
+                rule_sizes = [len(blob) for blob in rule_blobs]
+
+            def dumps(shard: Sequence[int]) -> str:
+                if matching_explanations:
+                    return json.dumps(
+                        {"rules": [rules[i]._raw for i in shard]},
+                        sort_keys=True,
+                        indent=2,
+                    )
+                return '{"rules":[' + ",".join(rule_blobs[i] for i in shard) + "]}"
 
             # adding rules option
 
+            num_shards = _shard_count(len(rules), self._jobs, sum(rule_sizes))
             logger.debug(f"Passing rules to semgrep-core in {num_shards} shards")
-            for file, rule_shard in zip(rule_files, _shard_rules(rules, num_shards)):
-                blob = dumps(rule_shard)
-                file.write(blob)
-                file.flush()
-                cmd.extend(["-rules", file.name])
+            for shard, rule_shard in enumerate(_shard_rules(rule_sizes, num_shards)):
+                cmd.extend(["-rules", write_shard(shard, dumps(rule_shard))])
+
+            # On disk now; for a large ruleset this is hundreds of megabytes.
+            rule_blobs.clear()
 
             # Turn on simple profiling. See Profiling.ml and simple_profiling.py
             if enabled_simple_profiling:
@@ -1419,16 +1407,19 @@ Exception raised: `{e}`
         )
 
     def validate_configs(
-        self, configs: Tuple[str, ...], no_python_schema_validation: bool = False
+        self,
+        configs: Tuple[str, ...],
     ) -> Sequence[SemgrepError]:
         if self._binary_path is None:  # should never happen, doing this for mypy
             raise SemgrepError("semgrep engine not found.")
 
+        # The metacheck pack is Semgrep-bundled (not user input), so its
+        # loading is always fully validated regardless of how the user asked
+        # us to validate their own rules.
         metachecks = Config.from_config_list(
             ["p/semgrep-rule-lints"],
             None,
             force_jsonschema=True,
-            no_python_schema_validation=no_python_schema_validation,
         )[0].get_rules(True)
 
         parsed_errors = []

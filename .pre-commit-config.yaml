@@ -9,7 +9,10 @@
 # This config defines also 2 "jobs" with the `stages: [manual]` directive
 # which are only exercised in CI (see .github/workflows/lint.yml).
 
-exclude: "^tests|^cli/tests/default/e2e.*/(targets|snapshots|rules/syntax)|^cli/tests/performance/targets_perf_sca|^cli/src/(semgrep|semdep)/external|^cli/bin|\\binvalid\\b|^libs/ocaml-tree-sitter-core|^libs/testo|^libs/pcre2|^cli/src/semgrep/semgrep_interfaces|languages/.*/semgrep-.*|tests/semgrep-rules|^cli/src/semgrep/semgrep_interfaces"
+# languages/.*/semgrep-.* : vendored grammars, must stay untouched (see scripts/check-vendored-ots)
+# libs/ocaml-tree-sitter-semgrep/{lang,core}: generated/upstream grammars + core
+# OCaml (historical indent); scripts/ follow the same hooks as the rest of OSS.
+exclude: "^tests|^cli/tests/default/e2e.*/(targets|snapshots|rules/syntax)|^cli/tests/performance/targets_perf_sca|^cli/src/(semgrep|semdep)/external|^cli/bin|\\binvalid\\b|^libs/ocaml-tree-sitter-semgrep/(lang|core)/|^libs/testo|^libs/pcre2|^cli/src/semgrep/semgrep_interfaces|languages/.*/semgrep-.*|tests/semgrep-rules|^cli/src/semgrep/semgrep_interfaces"
 
 default_stages: [commit]
 
@@ -91,8 +94,8 @@ repos:
     rev: v1.7.1 # PLEASE DO NOT CHANGE [see NOTE "Python"]
     hooks:
       - id: mypy
-        exclude: ^cli/tests/.+$|^setup.py$|^cli/src/semdep/external/packaging/.*$|^cli/src/semgrep/console_scripts/.*$|^cli/src/semdep/external/parsy/.*$|^cli/scripts/.*$|^scripts/.+$|^perf/.+$|^js/language_server/targets/.+$|^.github/workflows/libs/bump-uses.py$
-        args: [--config, mypy.ini, --show-error-codes, --python-version, "3.11"]
+        exclude: ^cli/tests/.+$|^setup.py$|^cli/src/semdep/external/packaging/.*$|^cli/src/semgrep/console_scripts/.*$|^cli/src/semdep/external/parsy/.*$|^cli/scripts/.*$|^scripts/.+$|^perf/.+$|^js/language_server/targets/.+$|^.github/workflows/libs/bump-uses.py$|^libs/ocaml-tree-sitter-semgrep/scripts/test_.*\.py$
+        args: [--config, mypy.ini, --show-error-codes, --scripts-are-modules, --python-version, "3.11"]
         additional_dependencies: &mypy-deps
           # versions must be manually synced:
           # - cli/setup.py lists dependencies
@@ -101,8 +104,7 @@ repos:
 
           # some packages ship with type definitions
           - attrs>=21.3
-          # click 8.1.4's new decorator type hints don't seem to work well
-          - click<8.1.4
+          - click~=8.4.2
           - packaging~=21.0
           - pydantic~=2.12.2
           - requests~=2.22
@@ -130,7 +132,7 @@ repos:
           - appdirs
           - pytest
           - pytest-mock
-          - mcp==1.16.0
+          - mcp==1.29.0
       - id: mypy
         alias: mypy-test
         name: mypy (test files)
@@ -280,7 +282,7 @@ repos:
   # Use a fixed version of p/python and p/bandit to not get new findings
   # We run `semgrep ci` for our main rulesets
   - repo: https://github.com/semgrep/pre-commit
-    rev: v1.151.0
+    rev: v1.171.0
     hooks:
       - id: semgrep
         name: Semgrep Python
@@ -303,7 +305,7 @@ repos:
     # the 'language: docker_image', the 'entry:' field will then specify
     # which version to use. In the case below, we're actually running
     # returntocorp/semgrep:develop if you look at .pre-commit-hooks.yaml
-    rev: v1.151.0
+    rev: v1.171.0
     hooks:
       - id: semgrep-docker-develop
         name: Semgrep Develop Python

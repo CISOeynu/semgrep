@@ -51,7 +51,7 @@ type value =
 [@@deriving show]
 
 type env = {
-  mvars : (MV.mvar, value) Hashtbl.t;
+  mvars : (MV.mvar, value) Base.Hashtbl.t;
   constant_propagation : bool;
   file : Fpath.t;
       (** The file that we are currently matching the AST of. We need this so that
@@ -93,7 +93,7 @@ let parse_json (file : string) : env * code =
        ("metavars", J.Object xs);
       ] ->
           let lang =
-            try ROHashtbl.find Lang.lang_map lang with
+            try ROHashtbl.Base.find Lang.lang_map lang with
             | Not_found -> failwith (spf "unsupported language %s" lang)
           in
           (* less: could also use Parse_pattern *)
@@ -107,7 +107,7 @@ let parse_json (file : string) : env * code =
           in
           let env =
             {
-              mvars = Hashtbl_.hash_of_list metavars;
+              mvars = Hashtbl_.Base.hash_of_list metavars;
               constant_propagation = true;
               file = Fpath.v file;
             }
@@ -226,15 +226,17 @@ let eval_regexp_matches ?(base_offset = 0) ~file ~regexp:re str =
    * alt: let s = value_to_string v in
    * to convert anything in a string before using regexps on it
    *)
-  let regexp = Pcre_.regexp ~flags:[ `ANCHORED ] re in
-  Xpattern_match_regexp.regexp_matcher ~base_offset
-    Xpattern_match_regexp.pcre_regex_functions str file regexp
-[@@alert "-deprecated"]
+  (* The regex here comes from a rule's metavariable-comparison expression and
+     is not validated at rule-parse time, so compilation can genuinely fail.
+     [compile_exn]'s message carries the pattern and the compile error; the
+     exception surfaces as a per-target error. *)
+  let regexp = Pcre2_.compile_exn ~options:[ `ANCHORED ] re in
+  Xpattern_match_regexp.regexp_matcher ~base_offset str file regexp
 
 let rec eval env code =
   match code.G.e with
   | G.L x -> value_of_lit ~code x
-  | G.N (G.Id ((_, _), { id_svalue = { contents = Some (G.Lit lit) }; _ }))
+  | G.N (G.Id ((_, _), { id_svalue = { contents = G.Lit lit }; _ }))
   (* coupling: Constant_propagation.eval *)
   | G.Call
       ( { e = G.N (G.Id (("!dockerfile_expand!", _), _)); _ },
@@ -244,9 +246,7 @@ let rec eval env code =
               {
                 e =
                   G.N
-                    (G.Id
-                       ( (_, _),
-                         { id_svalue = { contents = Some (G.Lit lit) }; _ } ));
+                    (G.Id ((_, _), { id_svalue = { contents = G.Lit lit }; _ }));
                 _;
               };
           ],
@@ -260,14 +260,14 @@ let rec eval env code =
   | G.DotAccess
       ( { e = G.N (Id ((("local" | "var"), _), _)); _ },
         _,
-        FN (Id (_, { id_svalue = { contents = Some (Lit lit); _ }; _ })) )
+        FN (Id (_, { id_svalue = { contents = Lit lit; _ }; _ })) )
     when env.constant_propagation ->
       value_of_lit ~code lit
   | G.Call ({ e = Special (ConcatString op, _); _ }, (_, args, _)) ->
       String (eval_concat_string_op env code op args)
   | G.N (G.Id ((s, _t), _idinfo))
     when Mvar.is_metavar_name s || Mvar.is_metavar_ellipsis s -> (
-      try Hashtbl.find env.mvars s with
+      try Hashtbl_.Base.find env.mvars s with
       | Not_found ->
           Log.warn (fun m -> m "could not find a value for %s in env" s);
           raise (NotInEnv s))
@@ -439,6 +439,10 @@ and eval_op op values code =
   | G.BitAnd, [ Int i1; Int i2 ] -> Int (Int64.logand i1 i2)
   | G.BitOr, [ Int i1; Int i2 ] -> Int (Int64.logor i1 i2)
   | G.BitXor, [ Int i1; Int i2 ] -> Int (Int64.logxor i1 i2)
+  | G.LSL, [ Int i1; Int i2 ] -> Int (Int64.shift_left i1 (Int64.to_int i2))
+  | G.ASR, [ Int i1; Int i2 ] -> Int (Int64.shift_right i1 (Int64.to_int i2))
+  | G.LSR, [ Int i1; Int i2 ] ->
+      Int (Int64.shift_right_logical i1 (Int64.to_int i2))
   | G.Eq, [ Int v1; Float v2 ] -> Bool (Int64.to_float v1 =*= v2)
   | G.Eq, [ Float v1; Int v2 ] -> Bool (v1 =*= Int64.to_float v2)
   (* TODO? dangerous use of polymorphic =*= ? *)
@@ -535,8 +539,13 @@ let bindings_to_env (config : Rule_options.t) ~file bindings =
           try
             Some
               ( mvar,
-                eval { mvars = Hashtbl.create 0; constant_propagation; file } e
-              )
+                eval
+                  {
+                    mvars = Base.Hashtbl.Poly.create ~size:0 ();
+                    constant_propagation;
+                    file;
+                  }
+                  e )
           with
           | NotHandled _
           | NotInEnv _ ->
@@ -559,7 +568,7 @@ let bindings_to_env (config : Rule_options.t) ~file bindings =
         | MV.E e -> try_bind_to_exp e
         | MV.Text (s, _, _) -> Some (mvar, String s)
         | x -> string_of_binding mvar x)
-    |> Hashtbl_.hash_of_list
+    |> Hashtbl_.Base.hash_of_list
   in
 
   { mvars; constant_propagation; file }
@@ -568,7 +577,7 @@ let bindings_to_env_just_strings (config : Rule_options.t) ~file xs =
   let mvars =
     xs
     |> List.filter_map (fun (mvar, mval) -> string_of_binding mvar mval)
-    |> Hashtbl_.hash_of_list
+    |> Hashtbl_.Base.hash_of_list
   in
 
   { mvars; constant_propagation = config.constant_propagation; file }

@@ -115,7 +115,11 @@ type name = {
 }
 [@@deriving show]
 
-let str_of_name name = Common.spf "%s:%s" (fst name.ident) (G.SId.show name.sid)
+(* This function is called for each variable access in the dataflow analyses.
+ * We avoid [G.SId.show] and [Printf] here because both are slow: the derived
+ * [show] goes through [Format]. The result is the same string. *)
+let str_of_name name =
+  fst name.ident ^ ":" ^ string_of_int (G.SId.to_int name.sid)
 
 let equal_name name1 name2 =
   let { ident = str1, _tok1; sid = sid1; id_info = _ } = name1 in
@@ -473,7 +477,14 @@ and other_stmt =
 
 and label = ident * G.sid
 and pattern_match = { scrutinee : name; branches : pattern_branch list }
-and pattern_branch = { pattern : pattern_spec; body : stmt list }
+
+and pattern_branch = {
+  patterns : pattern_spec list;
+      (** Patterns any one of which leads to executing [body] (e.g. ML-style
+          or-patterns [A | B | C -> ...], or Ruby's [when a, b, c]). Non-empty,
+          and all patterns must bind the same variables. *)
+  body : stmt list;  (** The statements to execute on a successful match. *)
+}
 
 and pattern_spec =
   | PatLiteral of G.literal

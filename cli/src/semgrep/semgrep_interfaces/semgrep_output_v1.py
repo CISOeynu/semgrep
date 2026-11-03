@@ -370,38 +370,6 @@ class Datetime:
 
 
 @dataclass(frozen=True)
-class DependencyChild:
-    """Original type: dependency_child = { ... }
-    """
-
-    package: str
-    version: str
-
-    @classmethod
-    def from_json(cls, x: Any) -> 'DependencyChild':
-        if isinstance(x, dict):
-            return cls(
-                package=_atd_read_string(x['package']) if 'package' in x else _atd_missing_json_field('DependencyChild', 'package'),
-                version=_atd_read_string(x['version']) if 'version' in x else _atd_missing_json_field('DependencyChild', 'version'),
-            )
-        else:
-            _atd_bad_json('DependencyChild', x)
-
-    def to_json(self) -> Any:
-        res: Dict[str, Any] = {}
-        res['package'] = _atd_write_string(self.package)
-        res['version'] = _atd_write_string(self.version)
-        return res
-
-    @classmethod
-    def from_json_string(cls, x: str) -> 'DependencyChild':
-        return cls.from_json(json.loads(x))
-
-    def to_json_string(self, **kw: Any) -> str:
-        return json.dumps(self.to_json(), **kw)
-
-
-@dataclass(frozen=True)
 class Direct:
     """Original type: dependency_kind = [ ... | Direct | ... ]
 
@@ -837,6 +805,76 @@ class Fpath:
 
     @classmethod
     def from_json_string(cls, x: str) -> 'Fpath':
+        return cls.from_json(json.loads(x))
+
+    def to_json_string(self, **kw: Any) -> str:
+        return json.dumps(self.to_json(), **kw)
+
+
+@dataclass(frozen=True)
+class DependencyChild:
+    """Original type: dependency_child = { ... }
+
+    :param lockfile_path: Path of the file the child was reported from, set
+    when the same package and version can be reported from several files, e.g.
+    one entry per Gradle module build file. Together with package and version
+    it identifies the found_dependency this child refers to. Since 1.177.0
+    """
+
+    package: str
+    version: str
+    lockfile_path: Optional[Fpath] = None
+
+    @classmethod
+    def from_json(cls, x: Any) -> 'DependencyChild':
+        if isinstance(x, dict):
+            return cls(
+                package=_atd_read_string(x['package']) if 'package' in x else _atd_missing_json_field('DependencyChild', 'package'),
+                version=_atd_read_string(x['version']) if 'version' in x else _atd_missing_json_field('DependencyChild', 'version'),
+                lockfile_path=Fpath.from_json(x['lockfile_path']) if 'lockfile_path' in x else None,
+            )
+        else:
+            _atd_bad_json('DependencyChild', x)
+
+    def to_json(self) -> Any:
+        res: Dict[str, Any] = {}
+        res['package'] = _atd_write_string(self.package)
+        res['version'] = _atd_write_string(self.version)
+        if self.lockfile_path is not None:
+            res['lockfile_path'] = (lambda x: x.to_json())(self.lockfile_path)
+        return res
+
+    @classmethod
+    def from_json_string(cls, x: str) -> 'DependencyChild':
+        return cls.from_json(json.loads(x))
+
+    def to_json_string(self, **kw: Any) -> str:
+        return json.dumps(self.to_json(), **kw)
+
+
+@dataclass
+class DependencyPath:
+    """Original type: dependency_path = { ... }
+    """
+
+    nodes: List[DependencyChild]
+
+    @classmethod
+    def from_json(cls, x: Any) -> 'DependencyPath':
+        if isinstance(x, dict):
+            return cls(
+                nodes=_atd_read_list(DependencyChild.from_json)(x['nodes']) if 'nodes' in x else _atd_missing_json_field('DependencyPath', 'nodes'),
+            )
+        else:
+            _atd_bad_json('DependencyPath', x)
+
+    def to_json(self) -> Any:
+        res: Dict[str, Any] = {}
+        res['nodes'] = _atd_write_list((lambda x: x.to_json()))(self.nodes)
+        return res
+
+    @classmethod
+    def from_json_string(cls, x: str) -> 'DependencyPath':
         return cls.from_json(json.loads(x))
 
     def to_json_string(self, **kw: Any) -> str:
@@ -1329,11 +1367,32 @@ class OpamLocked:
 
 
 @dataclass(frozen=True)
+class MavenInstallJson:
+    """Original type: lockfile_kind = [ ... | MavenInstallJson | ... ]
+
+    rules_jvm_external's pinned maven_install.json lockfile
+    https://github.com/bazel-contrib/rules_jvm_external
+    """
+
+    @property
+    def kind(self) -> str:
+        """Name of the class representing this variant."""
+        return 'MavenInstallJson'
+
+    @staticmethod
+    def to_json() -> Any:
+        return 'MavenInstallJson'
+
+    def to_json_string(self, **kw: Any) -> str:
+        return json.dumps(self.to_json(), **kw)
+
+
+@dataclass(frozen=True)
 class LockfileKind:
     """Original type: lockfile_kind = [ ... ]
     """
 
-    value: Union[PipRequirementsTxt, PoetryLock, PipfileLock, UvLock, NpmPackageLockJson, YarnLock, PnpmLock, BunLock, BunBinaryLock, GemfileLock, GoModLock, CargoLock, MavenDepTree, GradleLockfile, ComposerLock, NugetPackagesLockJson, PubspecLock, SwiftPackageResolved, PodfileLock, MixLock, ConanLock, OpamLocked]
+    value: Union[PipRequirementsTxt, PoetryLock, PipfileLock, UvLock, NpmPackageLockJson, YarnLock, PnpmLock, BunLock, BunBinaryLock, GemfileLock, GoModLock, CargoLock, MavenDepTree, GradleLockfile, ComposerLock, NugetPackagesLockJson, PubspecLock, SwiftPackageResolved, PodfileLock, MixLock, ConanLock, OpamLocked, MavenInstallJson]
 
     @property
     def kind(self) -> str:
@@ -1387,6 +1446,8 @@ class LockfileKind:
                 return cls(ConanLock())
             if x == 'OpamLocked':
                 return cls(OpamLocked())
+            if x == 'MavenInstallJson':
+                return cls(MavenInstallJson())
             _atd_bad_json('LockfileKind', x)
         _atd_bad_json('LockfileKind', x)
 
@@ -1910,11 +1971,32 @@ class BuildSbt:
 
 
 @dataclass(frozen=True)
+class ModuleBazel:
+    """Original type: manifest_kind = [ ... | ModuleBazel | ... ]
+
+    MODULE.bazel or WORKSPACE(.bazel) marks the root of a Bazel workspace.
+    https://bazel.build/external/module
+    """
+
+    @property
+    def kind(self) -> str:
+        """Name of the class representing this variant."""
+        return 'ModuleBazel'
+
+    @staticmethod
+    def to_json() -> Any:
+        return 'ModuleBazel'
+
+    def to_json_string(self, **kw: Any) -> str:
+        return json.dumps(self.to_json(), **kw)
+
+
+@dataclass(frozen=True)
 class ManifestKind:
     """Original type: manifest_kind = [ ... ]
     """
 
-    value: Union[RequirementsIn, SetupPy, PackageJson, Gemfile, GoModManifest, CargoToml, PomXml, BuildGradle, BuildGradleKts, SettingsGradle, ComposerJson, NugetManifestJson, PubspecYaml, PackageSwift, Podfile, MixExs, Pipfile, PyprojectToml, ConanFileTxt, ConanFilePy, Csproj, OpamFile, BuildSbt]
+    value: Union[RequirementsIn, SetupPy, PackageJson, Gemfile, GoModManifest, CargoToml, PomXml, BuildGradle, BuildGradleKts, SettingsGradle, ComposerJson, NugetManifestJson, PubspecYaml, PackageSwift, Podfile, MixExs, Pipfile, PyprojectToml, ConanFileTxt, ConanFilePy, Csproj, OpamFile, BuildSbt, ModuleBazel]
 
     @property
     def kind(self) -> str:
@@ -1970,6 +2052,8 @@ class ManifestKind:
                 return cls(OpamFile())
             if x == 'BuildSbt':
                 return cls(BuildSbt())
+            if x == 'ModuleBazel':
+                return cls(ModuleBazel())
             _atd_bad_json('ManifestKind', x)
         _atd_bad_json('ManifestKind', x)
 
@@ -3015,11 +3099,22 @@ class ScaPattern:
 @dataclass
 class DependencyMatch:
     """Original type: dependency_match = { ... }
+
+    :param dependency_paths: All known dependency paths by which the matched
+    (transitive) dependency was introduced into the project. Each path is
+    ordered from the direct dependency that introduced it (node 0) to the
+    matched (transitive) dependency (last node). Computed locally from the
+    resolved dependency graph at scan time; only populated when
+    dependency-graph (path-to-transitivity) resolution ran for the ecosystem.
+    Empty/absent for direct dependencies or ecosystems without graph
+    resolution. The number of paths per match is capped. EXPERIMENTAL since
+    1.166.0
     """
 
     dependency_pattern: ScaPattern
     found_dependency: FoundDependency
     lockfile: Fpath
+    dependency_paths: Optional[List[DependencyPath]] = None
 
     @classmethod
     def from_json(cls, x: Any) -> 'DependencyMatch':
@@ -3028,6 +3123,7 @@ class DependencyMatch:
                 dependency_pattern=ScaPattern.from_json(x['dependency_pattern']) if 'dependency_pattern' in x else _atd_missing_json_field('DependencyMatch', 'dependency_pattern'),
                 found_dependency=FoundDependency.from_json(x['found_dependency']) if 'found_dependency' in x else _atd_missing_json_field('DependencyMatch', 'found_dependency'),
                 lockfile=Fpath.from_json(x['lockfile']) if 'lockfile' in x else _atd_missing_json_field('DependencyMatch', 'lockfile'),
+                dependency_paths=_atd_read_list(DependencyPath.from_json)(x['dependency_paths']) if 'dependency_paths' in x else None,
             )
         else:
             _atd_bad_json('DependencyMatch', x)
@@ -3037,6 +3133,8 @@ class DependencyMatch:
         res['dependency_pattern'] = (lambda x: x.to_json())(self.dependency_pattern)
         res['found_dependency'] = (lambda x: x.to_json())(self.found_dependency)
         res['lockfile'] = (lambda x: x.to_json())(self.lockfile)
+        if self.dependency_paths is not None:
+            res['dependency_paths'] = _atd_write_list((lambda x: x.to_json()))(self.dependency_paths)
         return res
 
     @classmethod
@@ -5216,6 +5314,38 @@ class ResolutionCmdFailed:
 
 
 @dataclass(frozen=True)
+class IncompleteDependencyResolution:
+    """Original type: incomplete_dependency_resolution = { ... }
+    """
+
+    command: str
+    message: str
+
+    @classmethod
+    def from_json(cls, x: Any) -> 'IncompleteDependencyResolution':
+        if isinstance(x, dict):
+            return cls(
+                command=_atd_read_string(x['command']) if 'command' in x else _atd_missing_json_field('IncompleteDependencyResolution', 'command'),
+                message=_atd_read_string(x['message']) if 'message' in x else _atd_missing_json_field('IncompleteDependencyResolution', 'message'),
+            )
+        else:
+            _atd_bad_json('IncompleteDependencyResolution', x)
+
+    def to_json(self) -> Any:
+        res: Dict[str, Any] = {}
+        res['command'] = _atd_write_string(self.command)
+        res['message'] = _atd_write_string(self.message)
+        return res
+
+    @classmethod
+    def from_json_string(cls, x: str) -> 'IncompleteDependencyResolution':
+        return cls.from_json(json.loads(x))
+
+    def to_json_string(self, **kw: Any) -> str:
+        return json.dumps(self.to_json(), **kw)
+
+
+@dataclass(frozen=True)
 class UnsupportedManifest:
     """Original type: resolution_error_kind = [ ... | UnsupportedManifest | ... ]
     """
@@ -5316,10 +5446,32 @@ class ScaParseError:
 
 
 @dataclass(frozen=True)
+class IncompleteDependencyResolution_:
+    """Original type: resolution_error_kind = [ ... | IncompleteDependencyResolution of ... | ... ]
+
+    the dependency manager succeeded but returned an incomplete dependency
+    graph
+    """
+
+    value: IncompleteDependencyResolution
+
+    @property
+    def kind(self) -> str:
+        """Name of the class representing this variant."""
+        return 'IncompleteDependencyResolution_'
+
+    def to_json(self) -> Any:
+        return ['IncompleteDependencyResolution', (lambda x: x.to_json())(self.value)]
+
+    def to_json_string(self, **kw: Any) -> str:
+        return json.dumps(self.to_json(), **kw)
+
+
+@dataclass(frozen=True)
 class ResourceInaccessible_:
     """Original type: resolution_error_kind = [ ... | ResourceInaccessible of ... | ... ]
 
-    unable to access private registry, likely due to missing credentials
+    unable to retrieve a dependency from a registry
     """
 
     value: ResourceInaccessible
@@ -5341,7 +5493,7 @@ class ResolutionErrorKind:
     """Original type: resolution_error_kind = [ ... ]
     """
 
-    value: Union[UnsupportedManifest, MissingRequirement, ResolutionCmdFailed_, ParseDependenciesFailed, ScaParseError, ResourceInaccessible_]
+    value: Union[UnsupportedManifest, MissingRequirement, ResolutionCmdFailed_, ParseDependenciesFailed, ScaParseError, IncompleteDependencyResolution_, ResourceInaccessible_]
 
     @property
     def kind(self) -> str:
@@ -5364,6 +5516,8 @@ class ResolutionErrorKind:
                 return cls(ParseDependenciesFailed(_atd_read_string(x[1])))
             if cons == 'ScaParseError':
                 return cls(ScaParseError(ScaParserName.from_json(x[1])))
+            if cons == 'IncompleteDependencyResolution':
+                return cls(IncompleteDependencyResolution_(IncompleteDependencyResolution.from_json(x[1])))
             if cons == 'ResourceInaccessible':
                 return cls(ResourceInaccessible_(ResourceInaccessible.from_json(x[1])))
             _atd_bad_json('ResolutionErrorKind', x)
@@ -6808,6 +6962,7 @@ class TargetingConf:
     extra_gitignore_patterns_to_exclude_git_untracked_files: List[str] = field(default_factory=lambda: [])
     semgrepignore_filename: Optional[str] = None
     force_project_root: Optional[ProjectRoot] = None
+    include_binary_files: bool = field(default_factory=lambda: False)
     baseline_commit: Optional[str] = None
 
     @classmethod
@@ -6826,6 +6981,7 @@ class TargetingConf:
                 extra_gitignore_patterns_to_exclude_git_untracked_files=_atd_read_list(_atd_read_string)(x['extra_gitignore_patterns_to_exclude_git_untracked_files']) if 'extra_gitignore_patterns_to_exclude_git_untracked_files' in x else [],
                 semgrepignore_filename=_atd_read_string(x['semgrepignore_filename']) if 'semgrepignore_filename' in x else None,
                 force_project_root=ProjectRoot.from_json(x['force_project_root']) if 'force_project_root' in x else None,
+                include_binary_files=_atd_read_bool(x['include_binary_files']) if 'include_binary_files' in x else False,
                 baseline_commit=_atd_read_string(x['baseline_commit']) if 'baseline_commit' in x else None,
             )
         else:
@@ -6848,6 +7004,7 @@ class TargetingConf:
             res['semgrepignore_filename'] = _atd_write_string(self.semgrepignore_filename)
         if self.force_project_root is not None:
             res['force_project_root'] = (lambda x: x.to_json())(self.force_project_root)
+        res['include_binary_files'] = _atd_write_bool(self.include_binary_files)
         if self.baseline_commit is not None:
             res['baseline_commit'] = _atd_write_string(self.baseline_commit)
         return res
@@ -9217,6 +9374,52 @@ class SubprojectResolutionPlan:
 
 
 @dataclass
+class SkippedSubproject:
+    """Original type: skipped_subproject = { ... }
+
+    A subproject that was deliberately not resolved, and so contributed no
+    entries to ``ci_scan_dependencies``.
+
+    This is deliberately not ``unresolved_subproject``: that type embeds the
+    recursive ``dependency_source`` variant, which serializes to awkward
+    nested JSON.
+
+    :param root_dir: usually the directory of the manifest file
+    :param dependency_sources: The files that would have been used to resolve
+    this subproject, one entry per file. Each entry is tagged as a lockfile or
+    a manifest so that it can be matched against the corresponding field of
+    ``found_dependency``. A subproject with several lockfiles (MultiLockfile),
+    or one with both a manifest and a lockfile, produces several entries.
+    """
+
+    root_dir: Fpath
+    dependency_sources: List[DependencySourceFile]
+
+    @classmethod
+    def from_json(cls, x: Any) -> 'SkippedSubproject':
+        if isinstance(x, dict):
+            return cls(
+                root_dir=Fpath.from_json(x['root_dir']) if 'root_dir' in x else _atd_missing_json_field('SkippedSubproject', 'root_dir'),
+                dependency_sources=_atd_read_list(DependencySourceFile.from_json)(x['dependency_sources']) if 'dependency_sources' in x else _atd_missing_json_field('SkippedSubproject', 'dependency_sources'),
+            )
+        else:
+            _atd_bad_json('SkippedSubproject', x)
+
+    def to_json(self) -> Any:
+        res: Dict[str, Any] = {}
+        res['root_dir'] = (lambda x: x.to_json())(self.root_dir)
+        res['dependency_sources'] = _atd_write_list((lambda x: x.to_json()))(self.dependency_sources)
+        return res
+
+    @classmethod
+    def from_json_string(cls, x: str) -> 'SkippedSubproject':
+        return cls.from_json(json.loads(x))
+
+    def to_json_string(self, **kw: Any) -> str:
+        return json.dumps(self.to_json(), **kw)
+
+
+@dataclass
 class SkippedRule:
     """Original type: skipped_rule = { ... }
 
@@ -9416,6 +9619,9 @@ class ScanConfiguration:
     :param fips_mode: From 1.126.0. Customers in FIPS environments have
     specific hash function requirements that this flag will override. See
     SAF-2057 for details.
+    :param nosemgrep_disabled: From 1.166.0. Org-wide setting
+    (deployment.nosemgrep_disabled) that disables 'nosemgrep' inline ignore
+    comments for the scan.
     """
 
     rules: RawJson
@@ -9423,6 +9629,7 @@ class ScanConfiguration:
     triage_ignored_match_based_ids: List[str] = field(default_factory=lambda: [])
     project_merge_base: Optional[Sha1] = None
     fips_mode: bool = field(default_factory=lambda: False)
+    nosemgrep_disabled: bool = field(default_factory=lambda: False)
 
     @classmethod
     def from_json(cls, x: Any) -> 'ScanConfiguration':
@@ -9433,6 +9640,7 @@ class ScanConfiguration:
                 triage_ignored_match_based_ids=_atd_read_list(_atd_read_string)(x['triage_ignored_match_based_ids']) if 'triage_ignored_match_based_ids' in x else [],
                 project_merge_base=Sha1.from_json(x['project_merge_base']) if 'project_merge_base' in x else None,
                 fips_mode=_atd_read_bool(x['fips_mode']) if 'fips_mode' in x else False,
+                nosemgrep_disabled=_atd_read_bool(x['nosemgrep_disabled']) if 'nosemgrep_disabled' in x else False,
             )
         else:
             _atd_bad_json('ScanConfiguration', x)
@@ -9445,6 +9653,7 @@ class ScanConfiguration:
         if self.project_merge_base is not None:
             res['project_merge_base'] = (lambda x: x.to_json())(self.project_merge_base)
         res['fips_mode'] = _atd_write_bool(self.fips_mode)
+        res['nosemgrep_disabled'] = _atd_write_bool(self.nosemgrep_disabled)
         return res
 
     @classmethod
@@ -9551,6 +9760,8 @@ class EngineConfiguration:
     :param transitive_reachability_enabled: Whether to enable transitive
     reachability analysis for SCA findings
     :param product_ignored_files: from 1.71.0
+    :param gradle_module_attribution: Report Gradle dependencies at their
+    module build files. Disabled by default during rollout.
     :param generic_slow_rollout: for features we only want to turn on for
     select customers
     :param historical_config: from 1.63.0
@@ -9567,6 +9778,7 @@ class EngineConfiguration:
     transitive_reachability_enabled: bool = field(default_factory=lambda: False)
     ignored_files: List[str] = field(default_factory=lambda: [])
     product_ignored_files: Optional[ProductIgnoredFiles] = None
+    gradle_module_attribution: bool = field(default_factory=lambda: False)
     generic_slow_rollout: bool = field(default_factory=lambda: False)
     historical_config: Optional[HistoricalConfiguration] = None
     always_suppress_errors: bool = field(default_factory=lambda: False)
@@ -9584,6 +9796,7 @@ class EngineConfiguration:
                 transitive_reachability_enabled=_atd_read_bool(x['transitive_reachability_enabled']) if 'transitive_reachability_enabled' in x else False,
                 ignored_files=_atd_read_list(_atd_read_string)(x['ignored_files']) if 'ignored_files' in x else [],
                 product_ignored_files=ProductIgnoredFiles.from_json(x['product_ignored_files']) if 'product_ignored_files' in x else None,
+                gradle_module_attribution=_atd_read_bool(x['gradle_module_attribution']) if 'gradle_module_attribution' in x else False,
                 generic_slow_rollout=_atd_read_bool(x['generic_slow_rollout']) if 'generic_slow_rollout' in x else False,
                 historical_config=HistoricalConfiguration.from_json(x['historical_config']) if 'historical_config' in x else None,
                 always_suppress_errors=_atd_read_bool(x['always_suppress_errors']) if 'always_suppress_errors' in x else False,
@@ -9603,6 +9816,7 @@ class EngineConfiguration:
         res['ignored_files'] = _atd_write_list(_atd_write_string)(self.ignored_files)
         if self.product_ignored_files is not None:
             res['product_ignored_files'] = (lambda x: x.to_json())(self.product_ignored_files)
+        res['gradle_module_attribution'] = _atd_write_bool(self.gradle_module_attribution)
         res['generic_slow_rollout'] = _atd_write_bool(self.generic_slow_rollout)
         if self.historical_config is not None:
             res['historical_config'] = (lambda x: x.to_json())(self.historical_config)
@@ -9667,6 +9881,12 @@ class ScanMetadata:
     Scanning. Since 1.96.0
     :param enable_mal_deps: Override to enable malicious dependency rules for
     this scan, even if disabled at the deployment level.
+    :param partial_scan_rule_ids: If set, the backend should filter the
+    generated scan config down to only these rule IDs. Used by Semgrep Managed
+    Scanning to run fast supply-chain incident scans for a small set of rules.
+    Absent means a normal full scan. Acts as a filter on the config that would
+    otherwise be produced: rules not normally included for this scan will
+    still not run.
     """
 
     cli_version: Version
@@ -9677,6 +9897,7 @@ class ScanMetadata:
     ecosystems: List[str] = field(default_factory=lambda: [])
     packages: List[str] = field(default_factory=lambda: [])
     enable_mal_deps: Optional[bool] = None
+    partial_scan_rule_ids: Optional[List[RuleId]] = None
 
     @classmethod
     def from_json(cls, x: Any) -> 'ScanMetadata':
@@ -9690,6 +9911,7 @@ class ScanMetadata:
                 ecosystems=_atd_read_list(_atd_read_string)(x['ecosystems']) if 'ecosystems' in x else [],
                 packages=_atd_read_list(_atd_read_string)(x['packages']) if 'packages' in x else [],
                 enable_mal_deps=_atd_read_bool(x['enable_mal_deps']) if 'enable_mal_deps' in x else None,
+                partial_scan_rule_ids=_atd_read_list(RuleId.from_json)(x['partial_scan_rule_ids']) if 'partial_scan_rule_ids' in x else None,
             )
         else:
             _atd_bad_json('ScanMetadata', x)
@@ -9706,6 +9928,8 @@ class ScanMetadata:
         res['packages'] = _atd_write_list(_atd_write_string)(self.packages)
         if self.enable_mal_deps is not None:
             res['enable_mal_deps'] = _atd_write_bool(self.enable_mal_deps)
+        if self.partial_scan_rule_ids is not None:
+            res['partial_scan_rule_ids'] = _atd_write_list((lambda x: x.to_json()))(self.partial_scan_rule_ids)
         return res
 
     @classmethod
@@ -9944,6 +10168,58 @@ class ScanRequest:
 
     @classmethod
     def from_json_string(cls, x: str) -> 'ScanRequest':
+        return cls.from_json(json.loads(x))
+
+    def to_json_string(self, **kw: Any) -> str:
+        return json.dumps(self.to_json(), **kw)
+
+
+@dataclass
+class ScanParams:
+    """Original type: scan_params = { ... }
+
+    Parameters for CallScan.
+
+    Unlike the rest of this section, this is an EXTERNAL contract: it is
+    vendored by Guardian's fragment scanner rather than used by pysemgrep.
+    Breaking changes are allowed and to be expected.
+
+    :param rules: Path to a file containing the rules, as for CallValidate.
+    :param targets: Path to a file containing a 'targets' value, as for
+    -targets.
+    :param timeout: Maximum time to spend running one rule on one file, in
+    seconds. 0 disables the timeout.
+    :param timeout_threshold: Number of rules that may time out on a file
+    before the file is skipped. 0 disables the threshold.
+    """
+
+    rules: Fpath
+    targets: Fpath
+    timeout: float
+    timeout_threshold: int
+
+    @classmethod
+    def from_json(cls, x: Any) -> 'ScanParams':
+        if isinstance(x, dict):
+            return cls(
+                rules=Fpath.from_json(x['rules']) if 'rules' in x else _atd_missing_json_field('ScanParams', 'rules'),
+                targets=Fpath.from_json(x['targets']) if 'targets' in x else _atd_missing_json_field('ScanParams', 'targets'),
+                timeout=_atd_read_float(x['timeout']) if 'timeout' in x else _atd_missing_json_field('ScanParams', 'timeout'),
+                timeout_threshold=_atd_read_int(x['timeout_threshold']) if 'timeout_threshold' in x else _atd_missing_json_field('ScanParams', 'timeout_threshold'),
+            )
+        else:
+            _atd_bad_json('ScanParams', x)
+
+    def to_json(self) -> Any:
+        res: Dict[str, Any] = {}
+        res['rules'] = (lambda x: x.to_json())(self.rules)
+        res['targets'] = (lambda x: x.to_json())(self.targets)
+        res['timeout'] = _atd_write_float(self.timeout)
+        res['timeout_threshold'] = _atd_write_int(self.timeout_threshold)
+        return res
+
+    @classmethod
+    def from_json_string(cls, x: str) -> 'ScanParams':
         return cls.from_json(json.loads(x))
 
     def to_json_string(self, **kw: Any) -> str:
@@ -10436,6 +10712,8 @@ class ResolveDependenciesParams:
 
     :param allow_local_builds: whether to allow executing package manager
     commands
+    :param gradle_module_attribution: Preserve Gradle module dependency
+    instances and build-file paths in resolution results.
     :param package_manager_env: extra environment variables to pass to package
     manager subprocesses
     """
@@ -10443,6 +10721,7 @@ class ResolveDependenciesParams:
     dependency_sources: List[DependencySource]
     download_dependency_source_code: bool
     allow_local_builds: bool
+    gradle_module_attribution: bool = field(default_factory=lambda: False)
     package_manager_env: Optional[List[Tuple[str, str]]] = None
 
     @classmethod
@@ -10452,6 +10731,7 @@ class ResolveDependenciesParams:
                 dependency_sources=_atd_read_list(DependencySource.from_json)(x['dependency_sources']) if 'dependency_sources' in x else _atd_missing_json_field('ResolveDependenciesParams', 'dependency_sources'),
                 download_dependency_source_code=_atd_read_bool(x['download_dependency_source_code']) if 'download_dependency_source_code' in x else _atd_missing_json_field('ResolveDependenciesParams', 'download_dependency_source_code'),
                 allow_local_builds=_atd_read_bool(x['allow_local_builds']) if 'allow_local_builds' in x else _atd_missing_json_field('ResolveDependenciesParams', 'allow_local_builds'),
+                gradle_module_attribution=_atd_read_bool(x['gradle_module_attribution']) if 'gradle_module_attribution' in x else False,
                 package_manager_env=_atd_read_list((lambda x: (_atd_read_string(x[0]), _atd_read_string(x[1])) if isinstance(x, list) and len(x) == 2 else _atd_bad_json('array of length 2', x)))(x['package_manager_env']) if 'package_manager_env' in x else None,
             )
         else:
@@ -10462,6 +10742,7 @@ class ResolveDependenciesParams:
         res['dependency_sources'] = _atd_write_list((lambda x: x.to_json()))(self.dependency_sources)
         res['download_dependency_source_code'] = _atd_write_bool(self.download_dependency_source_code)
         res['allow_local_builds'] = _atd_write_bool(self.allow_local_builds)
+        res['gradle_module_attribution'] = _atd_write_bool(self.gradle_module_attribution)
         if self.package_manager_env is not None:
             res['package_manager_env'] = _atd_write_list((lambda x: [_atd_write_string(x[0]), _atd_write_string(x[1])] if isinstance(x, tuple) and len(x) == 2 else _atd_bad_python('tuple of length 2', x)))(self.package_manager_env)
         return res
@@ -11587,6 +11868,28 @@ class CallValidate:
 
 
 @dataclass(frozen=True)
+class CallScan:
+    """Original type: function_call = [ ... | CallScan of ... | ... ]
+
+    Run a pro intra-file scan. Called by Guardian's fragment scanner, not by
+    pysemgrep; see the scan_params doc.
+    """
+
+    value: ScanParams
+
+    @property
+    def kind(self) -> str:
+        """Name of the class representing this variant."""
+        return 'CallScan'
+
+    def to_json(self) -> Any:
+        return ['CallScan', (lambda x: x.to_json())(self.value)]
+
+    def to_json_string(self, **kw: Any) -> str:
+        return json.dumps(self.to_json(), **kw)
+
+
+@dataclass(frozen=True)
 class CallResolveDependencies:
     """Original type: function_call = [ ... | CallResolveDependencies of ... | ... ]
     """
@@ -11769,7 +12072,7 @@ class FunctionCall:
     """Original type: function_call = [ ... ]
     """
 
-    value: Union[CallContributions, CallApplyFixes, CallFormatter, CallSarifFormat, CallValidate, CallResolveDependencies, CallUploadSymbolAnalysis, CallDumpRulePartitions, CallGetTargets, CallTransitiveReachabilityFilter, CallMatchSubprojects, CallRunSymbolAnalysis, CallUploadSubprojectSymbolAnalysis, CallShowSubprojects]
+    value: Union[CallContributions, CallApplyFixes, CallFormatter, CallSarifFormat, CallValidate, CallScan, CallResolveDependencies, CallUploadSymbolAnalysis, CallDumpRulePartitions, CallGetTargets, CallTransitiveReachabilityFilter, CallMatchSubprojects, CallRunSymbolAnalysis, CallUploadSubprojectSymbolAnalysis, CallShowSubprojects]
 
     @property
     def kind(self) -> str:
@@ -11792,6 +12095,8 @@ class FunctionCall:
                 return cls(CallSarifFormat((lambda x: (SarifFormat.from_json(x[0]), FormatContext.from_json(x[1]), CliOutput.from_json(x[2])) if isinstance(x, list) and len(x) == 3 else _atd_bad_json('array of length 3', x))(x[1])))
             if cons == 'CallValidate':
                 return cls(CallValidate(Fpath.from_json(x[1])))
+            if cons == 'CallScan':
+                return cls(CallScan(ScanParams.from_json(x[1])))
             if cons == 'CallResolveDependencies':
                 return cls(CallResolveDependencies(ResolveDependenciesParams.from_json(x[1])))
             if cons == 'CallUploadSymbolAnalysis':
@@ -12404,6 +12709,15 @@ class CiScanResults:
     :param contributions: since semgrep 1.34.0
     :param dependencies: since semgrep 1.38.0. This data was originally sent
     to /complete, but we want to start sending it to /results
+    :param skipped_subprojects: since semgrep 1.173.0. Subprojects whose
+    dependencies were not resolved, and so are absent from ``dependencies``.
+    The app should NOT treat the dependencies of these subprojects as removed.
+    Absent (rather than empty) when sent by a CLI too old to report this,
+    which is not the same as a scan where nothing was skipped.
+    :param changed_dependency_sources: since semgrep 1.174.0. The dependency
+    sources (lockfiles or manifests) that the diff scan added or modified
+    relative to the merge base. Empty when the diff scan touched no dependency
+    source. Absent on full scans, since there is no base to compare against.
     :param metadata: filled in by the backend to associate scan results with
     the driving scan
     """
@@ -12417,6 +12731,8 @@ class CiScanResults:
     skipped_paths: List[Fpath] = field(default_factory=lambda: [])
     contributions: Optional[Contributions] = None
     dependencies: Optional[CiScanDependencies] = None
+    skipped_subprojects: Optional[List[SkippedSubproject]] = None
+    changed_dependency_sources: Optional[List[Fpath]] = None
     metadata: Optional[CiScanMetadata] = None
 
     @classmethod
@@ -12432,6 +12748,8 @@ class CiScanResults:
                 skipped_paths=_atd_read_list(Fpath.from_json)(x['skipped_paths']) if 'skipped_paths' in x else [],
                 contributions=Contributions.from_json(x['contributions']) if 'contributions' in x else None,
                 dependencies=CiScanDependencies.from_json(x['dependencies']) if 'dependencies' in x else None,
+                skipped_subprojects=_atd_read_list(SkippedSubproject.from_json)(x['skipped_subprojects']) if 'skipped_subprojects' in x else None,
+                changed_dependency_sources=_atd_read_list(Fpath.from_json)(x['changed_dependency_sources']) if 'changed_dependency_sources' in x else None,
                 metadata=CiScanMetadata.from_json(x['metadata']) if 'metadata' in x else None,
             )
         else:
@@ -12450,6 +12768,10 @@ class CiScanResults:
             res['contributions'] = (lambda x: x.to_json())(self.contributions)
         if self.dependencies is not None:
             res['dependencies'] = (lambda x: x.to_json())(self.dependencies)
+        if self.skipped_subprojects is not None:
+            res['skipped_subprojects'] = _atd_write_list((lambda x: x.to_json()))(self.skipped_subprojects)
+        if self.changed_dependency_sources is not None:
+            res['changed_dependency_sources'] = _atd_write_list((lambda x: x.to_json()))(self.changed_dependency_sources)
         if self.metadata is not None:
             res['metadata'] = (lambda x: x.to_json())(self.metadata)
         return res
@@ -12573,13 +12895,22 @@ class CiScanComplete:
 
     Sent by the CLI to /complete
 
+    :param skipped_subprojects: since semgrep 1.173.0. See the
+    identically-named field in ``ci_scan_results``. Sent to both endpoints for
+    the same reason ``dependencies`` is.
+    :param changed_dependency_sources: since semgrep 1.174.0 The dependency
+    sources (lockfiles or manifests) that the diff scan added or modified
+    relative to the merge base. Empty when the diff scan touched no dependency
+    source. Absent on full scans, since there is no base to compare against.
     :param task_id: since 1.31.0
     """
 
     exit_code: int
     stats: CiScanCompleteStats
     dependencies: Optional[CiScanDependencies] = None
+    skipped_subprojects: Optional[List[SkippedSubproject]] = None
     dependency_parser_errors: Optional[List[DependencyParserError]] = None
+    changed_dependency_sources: Optional[List[Fpath]] = None
     task_id: Optional[str] = None
     final_attempt: Optional[bool] = None
 
@@ -12590,7 +12921,9 @@ class CiScanComplete:
                 exit_code=_atd_read_int(x['exit_code']) if 'exit_code' in x else _atd_missing_json_field('CiScanComplete', 'exit_code'),
                 stats=CiScanCompleteStats.from_json(x['stats']) if 'stats' in x else _atd_missing_json_field('CiScanComplete', 'stats'),
                 dependencies=CiScanDependencies.from_json(x['dependencies']) if 'dependencies' in x else None,
+                skipped_subprojects=_atd_read_list(SkippedSubproject.from_json)(x['skipped_subprojects']) if 'skipped_subprojects' in x else None,
                 dependency_parser_errors=_atd_read_list(DependencyParserError.from_json)(x['dependency_parser_errors']) if 'dependency_parser_errors' in x else None,
+                changed_dependency_sources=_atd_read_list(Fpath.from_json)(x['changed_dependency_sources']) if 'changed_dependency_sources' in x else None,
                 task_id=_atd_read_string(x['task_id']) if 'task_id' in x else None,
                 final_attempt=_atd_read_bool(x['final_attempt']) if 'final_attempt' in x else None,
             )
@@ -12603,8 +12936,12 @@ class CiScanComplete:
         res['stats'] = (lambda x: x.to_json())(self.stats)
         if self.dependencies is not None:
             res['dependencies'] = (lambda x: x.to_json())(self.dependencies)
+        if self.skipped_subprojects is not None:
+            res['skipped_subprojects'] = _atd_write_list((lambda x: x.to_json()))(self.skipped_subprojects)
         if self.dependency_parser_errors is not None:
             res['dependency_parser_errors'] = _atd_write_list((lambda x: x.to_json()))(self.dependency_parser_errors)
+        if self.changed_dependency_sources is not None:
+            res['changed_dependency_sources'] = _atd_write_list((lambda x: x.to_json()))(self.changed_dependency_sources)
         if self.task_id is not None:
             res['task_id'] = _atd_write_string(self.task_id)
         if self.final_attempt is not None:
@@ -12890,6 +13227,105 @@ class GetConfigResponseV2:
         return json.dumps(self.to_json(), **kw)
 
 
+@dataclass
+class CoreOutput:
+    """Original type: core_output = { ... }
+
+    :param errors: errors are guaranteed to be duplicate free; see also
+    Report.ml
+    :param paths: targeting information
+    :param time: profiling information
+    :param explanations: debugging (rule writing) information. Note that as
+    opposed to the dataflow trace, the explanations are not embedded inside a
+    match because we give also explanations when things are not matching.
+    EXPERIMENTAL: since semgrep 0.109
+    :param rules_by_engine: These rules, classified by engine used, will let
+    us be transparent in the CLI output over what rules were run with what.
+    EXPERIMENTAL: since: 1.11.0
+    :param interfile_languages_used: Reporting just the requested engine isn't
+    granular enough. We want to know what languages had rules that invoked
+    interfile. This is particularly important for tracking the performance
+    impact of new interfile languages EXPERIMENTAL: since 1.49.0
+    :param skipped_rules: EXPERIMENTAL: since: 1.37.0
+    :param subprojects: SCA subproject resolution results. Note: this is only
+    available when logged in. EXPERIMENTAL: since: 1.125.0
+    :param mcp_scan_results: MCP scan results.
+    :param profiling_results: How long it took to execute this or that piece
+    of code in semgrep-core
+    :param symbol_analysis: since semgrep 1.108.0
+    """
+
+    version: Version
+    results: List[CoreMatch]
+    errors: List[CoreError]
+    paths: ScannedAndSkipped
+    time: Optional[Profile] = None
+    explanations: Optional[List[MatchingExplanation]] = None
+    rules_by_engine: Optional[List[RuleIdAndEngineKind]] = None
+    engine_requested: Optional[EngineKind] = None
+    interfile_languages_used: Optional[List[str]] = None
+    skipped_rules: List[SkippedRule] = field(default_factory=lambda: [])
+    subprojects: Optional[List[CliOutputSubprojectInfo]] = None
+    mcp_scan_results: Optional[McpScanResults] = None
+    profiling_results: List[ProfilingEntry] = field(default_factory=lambda: [])
+    symbol_analysis: Optional[SymbolAnalysis] = None
+
+    @classmethod
+    def from_json(cls, x: Any) -> 'CoreOutput':
+        if isinstance(x, dict):
+            return cls(
+                version=Version.from_json(x['version']) if 'version' in x else _atd_missing_json_field('CoreOutput', 'version'),
+                results=_atd_read_list(CoreMatch.from_json)(x['results']) if 'results' in x else _atd_missing_json_field('CoreOutput', 'results'),
+                errors=_atd_read_list(CoreError.from_json)(x['errors']) if 'errors' in x else _atd_missing_json_field('CoreOutput', 'errors'),
+                paths=ScannedAndSkipped.from_json(x['paths']) if 'paths' in x else _atd_missing_json_field('CoreOutput', 'paths'),
+                time=Profile.from_json(x['time']) if 'time' in x else None,
+                explanations=_atd_read_list(MatchingExplanation.from_json)(x['explanations']) if 'explanations' in x else None,
+                rules_by_engine=_atd_read_list(RuleIdAndEngineKind.from_json)(x['rules_by_engine']) if 'rules_by_engine' in x else None,
+                engine_requested=EngineKind.from_json(x['engine_requested']) if 'engine_requested' in x else None,
+                interfile_languages_used=_atd_read_list(_atd_read_string)(x['interfile_languages_used']) if 'interfile_languages_used' in x else None,
+                skipped_rules=_atd_read_list(SkippedRule.from_json)(x['skipped_rules']) if 'skipped_rules' in x else [],
+                subprojects=_atd_read_list(CliOutputSubprojectInfo.from_json)(x['subprojects']) if 'subprojects' in x else None,
+                mcp_scan_results=McpScanResults.from_json(x['mcp_scan_results']) if 'mcp_scan_results' in x else None,
+                profiling_results=_atd_read_list(ProfilingEntry.from_json)(x['profiling_results']) if 'profiling_results' in x else [],
+                symbol_analysis=SymbolAnalysis.from_json(x['symbol_analysis']) if 'symbol_analysis' in x else None,
+            )
+        else:
+            _atd_bad_json('CoreOutput', x)
+
+    def to_json(self) -> Any:
+        res: Dict[str, Any] = {}
+        res['version'] = (lambda x: x.to_json())(self.version)
+        res['results'] = _atd_write_list((lambda x: x.to_json()))(self.results)
+        res['errors'] = _atd_write_list((lambda x: x.to_json()))(self.errors)
+        res['paths'] = (lambda x: x.to_json())(self.paths)
+        if self.time is not None:
+            res['time'] = (lambda x: x.to_json())(self.time)
+        if self.explanations is not None:
+            res['explanations'] = _atd_write_list((lambda x: x.to_json()))(self.explanations)
+        if self.rules_by_engine is not None:
+            res['rules_by_engine'] = _atd_write_list((lambda x: x.to_json()))(self.rules_by_engine)
+        if self.engine_requested is not None:
+            res['engine_requested'] = (lambda x: x.to_json())(self.engine_requested)
+        if self.interfile_languages_used is not None:
+            res['interfile_languages_used'] = _atd_write_list(_atd_write_string)(self.interfile_languages_used)
+        res['skipped_rules'] = _atd_write_list((lambda x: x.to_json()))(self.skipped_rules)
+        if self.subprojects is not None:
+            res['subprojects'] = _atd_write_list((lambda x: x.to_json()))(self.subprojects)
+        if self.mcp_scan_results is not None:
+            res['mcp_scan_results'] = (lambda x: x.to_json())(self.mcp_scan_results)
+        res['profiling_results'] = _atd_write_list((lambda x: x.to_json()))(self.profiling_results)
+        if self.symbol_analysis is not None:
+            res['symbol_analysis'] = (lambda x: x.to_json())(self.symbol_analysis)
+        return res
+
+    @classmethod
+    def from_json_string(cls, x: str) -> 'CoreOutput':
+        return cls.from_json(json.loads(x))
+
+    def to_json_string(self, **kw: Any) -> str:
+        return json.dumps(self.to_json(), **kw)
+
+
 @dataclass(frozen=True)
 class ApplyFixesReturn:
     """Original type: apply_fixes_return = { ... }
@@ -13038,6 +13474,25 @@ class RetValidate:
 
     def to_json(self) -> Any:
         return ['RetValidate', _atd_write_option((lambda x: x.to_json()))(self.value)]
+
+    def to_json_string(self, **kw: Any) -> str:
+        return json.dumps(self.to_json(), **kw)
+
+
+@dataclass(frozen=True)
+class RetScan:
+    """Original type: function_return = [ ... | RetScan of ... | ... ]
+    """
+
+    value: CoreOutput
+
+    @property
+    def kind(self) -> str:
+        """Name of the class representing this variant."""
+        return 'RetScan'
+
+    def to_json(self) -> Any:
+        return ['RetScan', (lambda x: x.to_json())(self.value)]
 
     def to_json_string(self, **kw: Any) -> str:
         return json.dumps(self.to_json(), **kw)
@@ -13226,7 +13681,7 @@ class FunctionReturn:
     """Original type: function_return = [ ... ]
     """
 
-    value: Union[RetError, RetApplyFixes, RetContributions, RetFormatter, RetSarifFormat, RetValidate, RetResolveDependencies, RetUploadSymbolAnalysis, RetDumpRulePartitions, RetTransitiveReachabilityFilter, RetGetTargets, RetMatchSubprojects, RetRunSymbolAnalysis, RetUploadSubprojectSymbolAnalysis, RetShowSubprojects]
+    value: Union[RetError, RetApplyFixes, RetContributions, RetFormatter, RetSarifFormat, RetValidate, RetScan, RetResolveDependencies, RetUploadSymbolAnalysis, RetDumpRulePartitions, RetTransitiveReachabilityFilter, RetGetTargets, RetMatchSubprojects, RetRunSymbolAnalysis, RetUploadSubprojectSymbolAnalysis, RetShowSubprojects]
 
     @property
     def kind(self) -> str:
@@ -13249,6 +13704,8 @@ class FunctionReturn:
                 return cls(RetSarifFormat(_atd_read_string(x[1])))
             if cons == 'RetValidate':
                 return cls(RetValidate(_atd_read_option(CoreError.from_json)(x[1])))
+            if cons == 'RetScan':
+                return cls(RetScan(CoreOutput.from_json(x[1])))
             if cons == 'RetResolveDependencies':
                 return cls(RetResolveDependencies(_atd_read_list((lambda x: (DependencySource.from_json(x[0]), ResolutionResult.from_json(x[1])) if isinstance(x, list) and len(x) == 2 else _atd_bad_json('array of length 2', x)))(x[1])))
             if cons == 'RetUploadSymbolAnalysis':
@@ -13641,105 +14098,6 @@ class CoreOutputExtra:
 
     @classmethod
     def from_json_string(cls, x: str) -> 'CoreOutputExtra':
-        return cls.from_json(json.loads(x))
-
-    def to_json_string(self, **kw: Any) -> str:
-        return json.dumps(self.to_json(), **kw)
-
-
-@dataclass
-class CoreOutput:
-    """Original type: core_output = { ... }
-
-    :param errors: errors are guaranteed to be duplicate free; see also
-    Report.ml
-    :param paths: targeting information
-    :param time: profiling information
-    :param explanations: debugging (rule writing) information. Note that as
-    opposed to the dataflow trace, the explanations are not embedded inside a
-    match because we give also explanations when things are not matching.
-    EXPERIMENTAL: since semgrep 0.109
-    :param rules_by_engine: These rules, classified by engine used, will let
-    us be transparent in the CLI output over what rules were run with what.
-    EXPERIMENTAL: since: 1.11.0
-    :param interfile_languages_used: Reporting just the requested engine isn't
-    granular enough. We want to know what languages had rules that invoked
-    interfile. This is particularly important for tracking the performance
-    impact of new interfile languages EXPERIMENTAL: since 1.49.0
-    :param skipped_rules: EXPERIMENTAL: since: 1.37.0
-    :param subprojects: SCA subproject resolution results. Note: this is only
-    available when logged in. EXPERIMENTAL: since: 1.125.0
-    :param mcp_scan_results: MCP scan results.
-    :param profiling_results: How long it took to execute this or that piece
-    of code in semgrep-core
-    :param symbol_analysis: since semgrep 1.108.0
-    """
-
-    version: Version
-    results: List[CoreMatch]
-    errors: List[CoreError]
-    paths: ScannedAndSkipped
-    time: Optional[Profile] = None
-    explanations: Optional[List[MatchingExplanation]] = None
-    rules_by_engine: Optional[List[RuleIdAndEngineKind]] = None
-    engine_requested: Optional[EngineKind] = None
-    interfile_languages_used: Optional[List[str]] = None
-    skipped_rules: List[SkippedRule] = field(default_factory=lambda: [])
-    subprojects: Optional[List[CliOutputSubprojectInfo]] = None
-    mcp_scan_results: Optional[McpScanResults] = None
-    profiling_results: List[ProfilingEntry] = field(default_factory=lambda: [])
-    symbol_analysis: Optional[SymbolAnalysis] = None
-
-    @classmethod
-    def from_json(cls, x: Any) -> 'CoreOutput':
-        if isinstance(x, dict):
-            return cls(
-                version=Version.from_json(x['version']) if 'version' in x else _atd_missing_json_field('CoreOutput', 'version'),
-                results=_atd_read_list(CoreMatch.from_json)(x['results']) if 'results' in x else _atd_missing_json_field('CoreOutput', 'results'),
-                errors=_atd_read_list(CoreError.from_json)(x['errors']) if 'errors' in x else _atd_missing_json_field('CoreOutput', 'errors'),
-                paths=ScannedAndSkipped.from_json(x['paths']) if 'paths' in x else _atd_missing_json_field('CoreOutput', 'paths'),
-                time=Profile.from_json(x['time']) if 'time' in x else None,
-                explanations=_atd_read_list(MatchingExplanation.from_json)(x['explanations']) if 'explanations' in x else None,
-                rules_by_engine=_atd_read_list(RuleIdAndEngineKind.from_json)(x['rules_by_engine']) if 'rules_by_engine' in x else None,
-                engine_requested=EngineKind.from_json(x['engine_requested']) if 'engine_requested' in x else None,
-                interfile_languages_used=_atd_read_list(_atd_read_string)(x['interfile_languages_used']) if 'interfile_languages_used' in x else None,
-                skipped_rules=_atd_read_list(SkippedRule.from_json)(x['skipped_rules']) if 'skipped_rules' in x else [],
-                subprojects=_atd_read_list(CliOutputSubprojectInfo.from_json)(x['subprojects']) if 'subprojects' in x else None,
-                mcp_scan_results=McpScanResults.from_json(x['mcp_scan_results']) if 'mcp_scan_results' in x else None,
-                profiling_results=_atd_read_list(ProfilingEntry.from_json)(x['profiling_results']) if 'profiling_results' in x else [],
-                symbol_analysis=SymbolAnalysis.from_json(x['symbol_analysis']) if 'symbol_analysis' in x else None,
-            )
-        else:
-            _atd_bad_json('CoreOutput', x)
-
-    def to_json(self) -> Any:
-        res: Dict[str, Any] = {}
-        res['version'] = (lambda x: x.to_json())(self.version)
-        res['results'] = _atd_write_list((lambda x: x.to_json()))(self.results)
-        res['errors'] = _atd_write_list((lambda x: x.to_json()))(self.errors)
-        res['paths'] = (lambda x: x.to_json())(self.paths)
-        if self.time is not None:
-            res['time'] = (lambda x: x.to_json())(self.time)
-        if self.explanations is not None:
-            res['explanations'] = _atd_write_list((lambda x: x.to_json()))(self.explanations)
-        if self.rules_by_engine is not None:
-            res['rules_by_engine'] = _atd_write_list((lambda x: x.to_json()))(self.rules_by_engine)
-        if self.engine_requested is not None:
-            res['engine_requested'] = (lambda x: x.to_json())(self.engine_requested)
-        if self.interfile_languages_used is not None:
-            res['interfile_languages_used'] = _atd_write_list(_atd_write_string)(self.interfile_languages_used)
-        res['skipped_rules'] = _atd_write_list((lambda x: x.to_json()))(self.skipped_rules)
-        if self.subprojects is not None:
-            res['subprojects'] = _atd_write_list((lambda x: x.to_json()))(self.subprojects)
-        if self.mcp_scan_results is not None:
-            res['mcp_scan_results'] = (lambda x: x.to_json())(self.mcp_scan_results)
-        res['profiling_results'] = _atd_write_list((lambda x: x.to_json()))(self.profiling_results)
-        if self.symbol_analysis is not None:
-            res['symbol_analysis'] = (lambda x: x.to_json())(self.symbol_analysis)
-        return res
-
-    @classmethod
-    def from_json_string(cls, x: str) -> 'CoreOutput':
         return cls.from_json(json.loads(x))
 
     def to_json_string(self, **kw: Any) -> str:

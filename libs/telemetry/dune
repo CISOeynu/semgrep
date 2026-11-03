@@ -7,12 +7,15 @@
     uri
     yojson
     logs
+    lwt
     opentelemetry
     opentelemetry-client-ocurl
     opentelemetry-client-cohttp-eio
     opentelemetry-logs
+    opentelemetry-client
+    opentelemetry.ambient-context
     ambient-context-lwt
-    opentelemetry.ambient-context.eio
+    ambient-context-eio
   )
   (preprocess (pps
       ppx_deriving.show

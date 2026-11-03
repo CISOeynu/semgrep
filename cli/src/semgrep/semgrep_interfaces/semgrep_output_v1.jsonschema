@@ -654,7 +654,12 @@
       "properties": {
         "dependency_pattern": { "$ref": "#/definitions/sca_pattern" },
         "found_dependency": { "$ref": "#/definitions/found_dependency" },
-        "lockfile": { "$ref": "#/definitions/fpath" }
+        "lockfile": { "$ref": "#/definitions/fpath" },
+        "dependency_paths": {
+          "description": "All known dependency paths by which the matched (transitive) dependency was introduced into the project. Each path is ordered from the direct dependency that introduced it (node 0) to the matched (transitive) dependency (last node). Computed locally from the resolved dependency graph at scan time; only populated when dependency-graph (path-to-transitivity) resolution ran for the ecosystem. Empty/absent for direct dependencies or ecosystems without graph resolution. The number of paths per match is capped. EXPERIMENTAL since 1.166.0",
+          "type": "array",
+          "items": { "$ref": "#/definitions/dependency_path" }
+        }
       }
     },
     "sca_pattern": {
@@ -713,7 +718,21 @@
       "required": [ "package", "version" ],
       "properties": {
         "package": { "type": "string" },
-        "version": { "type": "string" }
+        "version": { "type": "string" },
+        "lockfile_path": {
+          "description": "Path of the file the child was reported from, set when the same package and version can be reported from several files, e.g. one entry per Gradle module build file. Together with package and version it identifies the found_dependency this child refers to. Since 1.177.0",
+          "$ref": "#/definitions/fpath"
+        }
+      }
+    },
+    "dependency_path": {
+      "type": "object",
+      "required": [ "nodes" ],
+      "properties": {
+        "nodes": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/dependency_child" }
+        }
       }
     },
     "validation_state": {
@@ -1621,6 +1640,10 @@
         "fips_mode": {
           "description": "From 1.126.0. Customers in FIPS environments have specific hash function requirements that this flag will override. See SAF-2057 for details.",
           "type": "boolean"
+        },
+        "nosemgrep_disabled": {
+          "description": "From 1.166.0. Org-wide setting (deployment.nosemgrep_disabled) that disables 'nosemgrep' inline ignore comments for the scan.",
+          "type": "boolean"
         }
       }
     },
@@ -1652,6 +1675,10 @@
         "product_ignored_files": {
           "description": "from 1.71.0",
           "$ref": "#/definitions/product_ignored_files"
+        },
+        "gradle_module_attribution": {
+          "description": "Report Gradle dependencies at their module build files. Disabled by default during rollout.",
+          "type": "boolean"
         },
         "generic_slow_rollout": {
           "description": "for features we only want to turn on for select customers",
@@ -1813,6 +1840,11 @@
         "enable_mal_deps": {
           "description": "Override to enable malicious dependency rules for this scan, even if disabled at the deployment level.",
           "type": "boolean"
+        },
+        "partial_scan_rule_ids": {
+          "description": "If set, the backend should filter the generated scan config down to only these rule IDs. Used by Semgrep Managed Scanning to run fast supply-chain incident scans for a small set of rules. Absent means a normal full scan. Acts as a filter on the config that would otherwise be produced: rules not normally included for this scan will still not run.",
+          "type": "array",
+          "items": { "$ref": "#/definitions/rule_id" }
         }
       }
     },
@@ -1944,6 +1976,16 @@
           "description": "since semgrep 1.38.0. This data was originally sent to /complete, but we want to start sending it to /results",
           "$ref": "#/definitions/ci_scan_dependencies"
         },
+        "skipped_subprojects": {
+          "description": "since semgrep 1.173.0. Subprojects whose dependencies were not resolved, and so are absent from {{dependencies}} . The app should NOT treat the dependencies of these subprojects as removed. Absent (rather than empty) when sent by a CLI too old to report this, which is not the same as a scan where nothing was skipped.",
+          "type": "array",
+          "items": { "$ref": "#/definitions/skipped_subproject" }
+        },
+        "changed_dependency_sources": {
+          "description": "since semgrep 1.174.0. The dependency sources (lockfiles or manifests) that the diff scan added or modified relative to the merge base. Empty when the diff scan touched no dependency source. Absent on full scans, since there is no base to compare against.",
+          "type": "array",
+          "items": { "$ref": "#/definitions/fpath" }
+        },
         "metadata": {
           "description": "filled in by the backend to associate scan results with the driving scan",
           "$ref": "#/definitions/ci_scan_metadata"
@@ -2024,9 +2066,19 @@
         "exit_code": { "type": "integer" },
         "stats": { "$ref": "#/definitions/ci_scan_complete_stats" },
         "dependencies": { "$ref": "#/definitions/ci_scan_dependencies" },
+        "skipped_subprojects": {
+          "description": "since semgrep 1.173.0. See the identically-named field in {{ci_scan_results}} . Sent to both endpoints for the same reason {{dependencies}} is.",
+          "type": "array",
+          "items": { "$ref": "#/definitions/skipped_subproject" }
+        },
         "dependency_parser_errors": {
           "type": "array",
           "items": { "$ref": "#/definitions/dependency_parser_error" }
+        },
+        "changed_dependency_sources": {
+          "description": "since semgrep 1.174.0 The dependency sources (lockfiles or manifests) that the diff scan added or modified relative to the merge base. Empty when the diff scan touched no dependency source. Absent on full scans, since there is no base to compare against.",
+          "type": "array",
+          "items": { "$ref": "#/definitions/fpath" }
         },
         "task_id": { "description": "since 1.31.0", "type": "string" },
         "final_attempt": { "type": "boolean" }
@@ -2107,6 +2159,22 @@
       "additionalProperties": {
         "type": "array",
         "items": { "$ref": "#/definitions/found_dependency" }
+      }
+    },
+    "skipped_subproject": {
+      "description": "A subproject that was deliberately not resolved, and so contributed no entries to {{ci_scan_dependencies}} .\n\nThis is deliberately not {{unresolved_subproject}} : that type embeds the recursive {{dependency_source}} variant, which serializes to awkward nested JSON.",
+      "type": "object",
+      "required": [ "root_dir", "dependency_sources" ],
+      "properties": {
+        "root_dir": {
+          "description": "usually the directory of the manifest file",
+          "$ref": "#/definitions/fpath"
+        },
+        "dependency_sources": {
+          "description": "The files that would have been used to resolve this subproject, one entry per file. Each entry is tagged as a lockfile or a manifest so that it can be matched against the corresponding field of {{found_dependency}} . A subproject with several lockfiles (MultiLockfile), or one with both a manifest and a lockfile, produces several entries.",
+          "type": "array",
+          "items": { "$ref": "#/definitions/dependency_source_file" }
+        }
       }
     },
     "dependency_parser_error": {
@@ -2720,6 +2788,7 @@
         },
         "force_novcs_project": { "type": "boolean" },
         "exclude_minified_files": { "type": "boolean" },
+        "include_binary_files": { "type": "boolean" },
         "baseline_commit": { "type": "string" }
       }
     },
@@ -2901,6 +2970,29 @@
         "strategy": { "type": "string" }
       }
     },
+    "scan_params": {
+      "description": "Parameters for CallScan.\n\nUnlike the rest of this section, this is an EXTERNAL contract: it is vendored by Guardian's fragment scanner rather than used by pysemgrep. Breaking changes are allowed and to be expected.",
+      "type": "object",
+      "required": [ "rules", "targets", "timeout", "timeout_threshold" ],
+      "properties": {
+        "rules": {
+          "description": "Path to a file containing the rules, as for CallValidate.",
+          "$ref": "#/definitions/fpath"
+        },
+        "targets": {
+          "description": "Path to a file containing a 'targets' value, as for -targets.",
+          "$ref": "#/definitions/fpath"
+        },
+        "timeout": {
+          "description": "Maximum time to spend running one rule on one file, in seconds. 0 disables the timeout.",
+          "type": "number"
+        },
+        "timeout_threshold": {
+          "description": "Number of rules that may time out on a file before the file is skipped. 0 disables the threshold.",
+          "type": "integer"
+        }
+      }
+    },
     "lockfile_kind": {
       "oneOf": [
         { "const": "PipRequirementsTxt" },
@@ -2930,7 +3022,11 @@
         { "const": "PodfileLock" },
         { "const": "MixLock" },
         { "const": "ConanLock" },
-        { "const": "OpamLocked" }
+        { "const": "OpamLocked" },
+        {
+          "description": "rules_jvm_external's pinned maven_install.json lockfile https://github.com/bazel-contrib/rules_jvm_external",
+          "const": "MavenInstallJson"
+        }
       ]
     },
     "manifest_kind": {
@@ -3026,6 +3122,10 @@
         {
           "description": "build.sbt - https://www.scala-sbt.org/1.x/docs/Basic-Def.html",
           "const": "BuildSbt"
+        },
+        {
+          "description": "MODULE.bazel or WORKSPACE(.bazel) marks the root of a Bazel workspace. https://bazel.build/external/module",
+          "const": "ModuleBazel"
         }
       ]
     },
@@ -3187,7 +3287,19 @@
           "items": false,
           "prefixItems": [
             {
-              "description": "unable to access private registry, likely due to missing credentials",
+              "description": "the dependency manager succeeded but returned an incomplete dependency graph",
+              "const": "IncompleteDependencyResolution"
+            },
+            { "$ref": "#/definitions/incomplete_dependency_resolution" }
+          ]
+        },
+        {
+          "type": "array",
+          "minItems": 2,
+          "items": false,
+          "prefixItems": [
+            {
+              "description": "unable to retrieve a dependency from a registry",
               "const": "ResourceInaccessible"
             },
             { "$ref": "#/definitions/resource_inaccessible" }
@@ -3196,6 +3308,14 @@
       ]
     },
     "resolution_cmd_failed": {
+      "type": "object",
+      "required": [ "command", "message" ],
+      "properties": {
+        "command": { "type": "string" },
+        "message": { "type": "string" }
+      }
+    },
+    "incomplete_dependency_resolution": {
       "type": "object",
       "required": [ "command", "message" ],
       "properties": {
@@ -3402,6 +3522,10 @@
         "download_dependency_source_code": { "type": "boolean" },
         "allow_local_builds": {
           "description": "whether to allow executing package manager commands",
+          "type": "boolean"
+        },
+        "gradle_module_attribution": {
+          "description": "Preserve Gradle module dependency instances and build-file paths in resolution results.",
           "type": "boolean"
         },
         "package_manager_env": {
@@ -3651,6 +3775,18 @@
           "minItems": 2,
           "items": false,
           "prefixItems": [
+            {
+              "description": "Run a pro intra-file scan. Called by Guardian's fragment scanner, not by pysemgrep; see the scan_params doc.",
+              "const": "CallScan"
+            },
+            { "$ref": "#/definitions/scan_params" }
+          ]
+        },
+        {
+          "type": "array",
+          "minItems": 2,
+          "items": false,
+          "prefixItems": [
             { "const": "CallResolveDependencies" },
             { "$ref": "#/definitions/resolve_dependencies_params" }
           ]
@@ -3814,6 +3950,14 @@
                 { "const": "None" }
               ]
             }
+          ]
+        },
+        {
+          "type": "array",
+          "minItems": 2,
+          "items": false,
+          "prefixItems": [
+            { "const": "RetScan" }, { "$ref": "#/definitions/core_output" }
           ]
         },
         {

@@ -69,7 +69,7 @@
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional, TextIO
+from typing import Any, Dict, List, Optional, TextIO
 import json
 import re
 
@@ -89,7 +89,7 @@ class Maturity(Enum):
     # GA means "general availability"
     GA = "ga"
 
-    def to_json(self):
+    def to_json(self) -> str:
         return self.value
 
 
@@ -167,7 +167,7 @@ class Language():
     # - "is_python" - for Python, Python2, Python3
     tags: List[str] = field(default_factory=list)
 
-    def to_json(self):
+    def to_json(self) -> Dict[str, Any]:
         if self.comment:
             # Remove indentation from comment lines
             comment = re.sub("\n +", "\n", self.comment)
@@ -450,6 +450,15 @@ not ambiguous is welcome here.
     ),
     Language(
         comment="",
+        id_="objc",
+        name="Objective-C",
+        keys=["objc", "objectivec", "objective-c"],
+        exts=[".m"],
+        maturity=Maturity.ALPHA,
+        shebangs=[]
+    ),
+    Language(
+        comment="",
         id_="ocaml",
         name="OCaml",
         keys=["ocaml"],
@@ -530,15 +539,6 @@ not ambiguous is welcome here.
     ),
     Language(
         comment="",
-        id_="ql",
-        name="QL",
-        keys=["ql"],
-        exts=[".ql", ".qll"],
-        example_ext=".ql",
-        maturity=Maturity.ALPHA,
-    ),
-    Language(
-        comment="",
         id_="r",
         name="R",
         keys=["r"],
@@ -605,7 +605,7 @@ not ambiguous is welcome here.
         id_="terraform",
         name="Terraform",
         keys=["tf", "hcl", "terraform"],
-        exts=[".tf", ".hcl", ".tfvars"],
+        exts=[".tf", ".tofu", ".hcl", ".tfvars"],
         maturity=Maturity.GA,
         shebangs=[]
     ),

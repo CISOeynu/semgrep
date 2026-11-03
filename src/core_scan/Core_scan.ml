@@ -171,11 +171,11 @@ let filter_files_with_too_many_matches_and_transform_as_timeout
     |> List.filter_map (fun (file, xs) ->
         if List.length xs > max_match_per_file then Some file else None)
   in
-  let offending_files = Hashtbl_.hashset_of_list offending_file_list in
+  let offending_files = Hashtbl_.Base.hashset_of_list offending_file_list in
   let new_matches =
     matches
     |> List_.exclude (fun ({ pm; _ } : Core_result.processed_match) ->
-        Hashtbl.mem offending_files pm.path.internal_path_to_content)
+        Base.Hashtbl.mem offending_files pm.path.internal_path_to_content)
   in
   let new_errors, new_skipped =
     offending_file_list
@@ -307,6 +307,11 @@ let translate_targeting_conf_from_pysemgrep (par_conf : Parallelism_config.t)
               Find_targets.Git_remote { url = Uri.of_string str });
     force_novcs_project = conf.force_novcs_project;
     exclude_minified_files = conf.exclude_minified_files;
+    (* coupling: the wire field is [include_binary_files] (optional, default
+     * false, i.e. binaries excluded); Find_targets keeps the
+     * [exclude_binary_files] spelling, so we invert here at the pysemgrep
+     * boundary. *)
+    exclude_binary_files = not conf.include_binary_files;
     baseline_commit = conf.baseline_commit;
     par_conf;
     num_jobs = Some num_jobs;

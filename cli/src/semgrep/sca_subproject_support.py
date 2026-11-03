@@ -55,6 +55,10 @@ PTT_DYNAMIC_RESOLUTION_SUBPROJECT_KINDS: List[SubprojectKind] = [
         out.ManifestKind(out.Pipfile()),
         out.LockfileKind(out.PipfileLock()),
     ),
+    (
+        out.ManifestKind(out.GoModManifest()),
+        out.LockfileKind(out.GoModLock()),
+    ),
 ]
 
 # Subproject kinds that we use ocaml parsers for only when transitive reachability is
@@ -75,6 +79,18 @@ ALWAYS_OCAML_PARSER_SUBPROJECT_KINDS: List[SubprojectKind] = [
     (None, out.LockfileKind(out.NpmPackageLockJson())),
     (out.ManifestKind(out.PackageJson()), out.LockfileKind(out.NpmPackageLockJson())),
     (out.ManifestKind(out.PyprojectToml()), out.LockfileKind(out.UvLock())),
+    (out.ManifestKind(out.PyprojectToml()), out.LockfileKind(out.PoetryLock())),
+    (out.ManifestKind(out.PackageJson()), out.LockfileKind(out.BunLock())),
+]
+
+# Gradle builds resolved from their build files without a lockfile. With
+# gradle_module_attribution on, the resolve_dependencies RPC reports one
+# dependency entry per module build file for these; every other kind, including
+# Gradle builds resolved from an SBOM or a lockfile, keeps one entry per package.
+GRADLE_MODULE_ATTRIBUTION_SUBPROJECT_KINDS: List[SubprojectKind] = [
+    (out.ManifestKind(out.BuildGradle()), None),
+    (out.ManifestKind(out.BuildGradleKts()), None),
+    (out.ManifestKind(out.SettingsGradle()), None),
 ]
 
 # All subproject kinds that are supported for transitive reachability, regardless

@@ -62,5 +62,12 @@ val eval : ('a -> bool) -> 'a t -> bool
 val map : ('a -> 'b) -> 'a t -> 'b t
 (** [map f formula] applies [f] to each predicate in [formula] *)
 
+val sort_by_cost : cost:('a -> int) -> 'a t -> 'a t
+(** [sort_by_cost ~cost formula] stably reorders the children of every [And]
+    and [Or] cheapest first, ranking a subtree by its most expensive
+    predicate. Since [eval] short-circuits, this lets us check cheap predicates
+    before expensive ones, possibly shortening the time needed to run; being
+    stable, it otherwise keeps the order the rule author wrote. *)
+
 val predicates : 'a t -> 'a list
 (** [predicates formula] returns a list of all predicates in [formula] *)

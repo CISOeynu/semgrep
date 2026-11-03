@@ -69,6 +69,7 @@ ENGINE_KIND_ATTR = "scan.engine_type"
 _PYRO_CAML_TAGS = "PYRO_CAML_TAGS"
 _PYRO_CAML_SERVICE_NAME = "PYRO_CAML_SERVICE_NAME"
 _PYRO_CAML_SERVER_ADDRESS = "PYRO_CAML_SERVER_ADDRESS"
+_PYRO_CAML_MEMPROF_SAMPLING_RATE = "PYRO_CAML_MEMPROF_SAMPLING_RATE"
 _SEMGREP_TRACE_PARENT_TRACE_ID = "SEMGREP_TRACE_PARENT_TRACE_ID"
 _SEMGREP_TRACE_PARENT_SPAN_ID = "SEMGREP_TRACE_PARENT_SPAN_ID"
 
@@ -153,6 +154,7 @@ def cli_args_to_attrs(locals: dict[str, object]) -> Attributes:
         "jobs",
         "max_memory",
         "max_target_bytes",
+        "secrets",
         "supply_chain",
         "timeout_threshold",
         "timeout",
@@ -162,7 +164,7 @@ def cli_args_to_attrs(locals: dict[str, object]) -> Attributes:
     # prefix all with scan.args
     info: dict[str, str | int] = {}
     for arg in args_to_include:
-        value = locals.get(arg)
+        value = locals.get("run_secrets_flag" if arg == "secrets" else arg)
         if isinstance(value, int) or isinstance(value, str):
             attr_value = value
         elif value is not None:
@@ -171,6 +173,15 @@ def cli_args_to_attrs(locals: dict[str, object]) -> Attributes:
             attr_value = "unset"
         info[f"scan.args.{arg}"] = attr_value
     return info
+
+
+def scan_product_attrs(*, code: bool, supply_chain: bool, secrets: bool) -> Attributes:
+    """Attributes for products enabled by a scan's resolved configuration."""
+    return {
+        "scan.product.code": code,
+        "scan.product.supply_chain": supply_chain,
+        "scan.product.secrets": secrets,
+    }
 
 
 def scan_info_to_attrs(scan_info: ScanInfo) -> Attributes:
@@ -241,11 +252,15 @@ def record_phase_data(
 # So we create this class that allows us to mutate the resource afterwards
 class MutableResource(Resource):
     _mutable_attributes: BoundedAttributes
+    # Keys present at construction take precedence over later update_attributes calls,
+    # so OTEL_RESOURCE_ATTRIBUTES can override values written later in the scan flow.
+    _frozen_keys: frozenset[str]
 
     def __init__(self, base_resource: Resource) -> None:
         self._mutable_attributes = BoundedAttributes(
             attributes=base_resource.attributes, immutable=False
         )
+        self._frozen_keys = frozenset(base_resource.attributes.keys())
         super().__init__(
             attributes=self._mutable_attributes, schema_url=base_resource.schema_url
         )
@@ -260,6 +275,8 @@ class MutableResource(Resource):
         if not new_attrs:
             return
         for k in new_attrs:
+            if k in self._frozen_keys:
+                continue
             self._mutable_attributes[k] = new_attrs[k]
 
 
@@ -396,6 +413,9 @@ class Telemetry:
             + attrs_to_kv_strs(filter_attrs_for_inject(self.resource.attributes))
         )
         os.environ[_PYRO_CAML_SERVICE_NAME] = "semgrep-core"
+        # Higher rates overflow the runtime events ring buffer and slow scans
+        # down; 1e-6 keeps sample loss and overhead low on real scans.
+        os.environ.setdefault(_PYRO_CAML_MEMPROF_SAMPLING_RATE, "1e-6")
         os.environ[_PYRO_CAML_SERVER_ADDRESS] = (
             _PYROSCOPE_ENDPOINT_ALIASES.get(self.trace_endpoint, self.trace_endpoint)
             if self.trace_endpoint

@@ -33,7 +33,7 @@ local github_bot = {
 // ----------------------------------------------------------------------------
 
 // default one
-local opam_switch = 'ocaml-variants.5.3.0+options,ocaml-option-flambda';
+local opam_switch = 'ocaml-variants.5.4.0+options,ocaml-option-flambda';
 // also default but needed by another nameso we can use it as a function default arg
 local opam_switch_default = opam_switch;
 local containers = {
@@ -142,21 +142,65 @@ local slack = {
 //
 // coupling: if you modify the compiler pin sha you will need to bump this
 // prefix (or similar) to invalidate the cache
-local opam_cache_version = 'v5';
+local opam_cache_version = 'v8';
+
+// We pin the upstream opam-repository to a commit rather than
+// tracking its HEAD.
+// coupling: bump opam_cache_version above when changing this so the cached
+// opam root (which embeds the repository) is invalidated.
+// coupling: keep this in sync with OPAM_REPOSITORY_PIN in OSS/Makefile.
+local opam_repository_pin = '922f67e068446a8d8e809a40251a259bd0549552';
 
 // this must be done after the checkout as opam installs itself
 // locally in the project folder (/home/runner/work/semgrep/semgrep/_opam)
-// TODO upstream the changes in austin's custom setup-ocaml action,
-// or move the project to the semgrep org
 // coupling: default is above opam_switch
-local opam_setup = function(opam_switch=opam_switch_default) {
+//
+// 'checkout_path' is the path the repository was checked out into, relative to
+// the workspace root (e.g. 'semgrep-proprietary' when a workflow checks the
+// repo out into a subdir). It must match the 'path' passed to the checkout
+// step, otherwise the lockfile globs below won't match and the cache prefix
+// silently collapses to a static value (poisoning the cache across switches).
+// Defaults to '' for the common case of checking out at the workspace root.
+//
+// 'cache_profile' names the installed dependency set (format, grammar,
+// semgrep, interfaces, lockfiles). It is part of the opam cache key so
+// those sets never share one switch.
+local opam_setup = function(opam_switch=opam_switch_default, checkout_path='', cache_profile='semgrep') {
+  // normalize to a glob prefix: '' -> '', 'foo' -> 'foo/'
+  local p = if checkout_path == '' then '' else checkout_path + '/',
   uses: uses.semgrep.setup_ocaml,
+  // OPAM 2.5.0 repository setup failed while traversing the fetched Git tree:
+  // "lstat" failed on /home/runner/.opam/repo/default/.git/objects/maintenance.lock: No such file or directory
+  // [ERROR] Initial repository fetch failed
+  // Disable fetch-triggered Git maintenance so its temporary lock cannot disappear
+  // during traversal. Scope the setting to this action and its subprocesses.
+  env: {
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: 'maintenance.auto',
+    GIT_CONFIG_VALUE_0: 'false',
+  },
   with: {
     'ocaml-compiler': opam_switch,
     'opam-pin': false,
+    // Pin the opam-repository to a known-good commit for reproducible
+    // resolution (see opam_repository_pin above).
+    'opam-repositories': |||
+      default: https://github.com/ocaml/opam-repository.git#%s
+    ||| % opam_repository_pin,
     // Save the cache post run instead of after installing the compiler
     'save-opam-post-run': true,
-    'cache-prefix': opam_cache_version,
+    // Different installed dependency sets must never share an immutable cache.
+    'cache-prefix': '%s-%s-${{ hashFiles(%s) }}' % [
+      opam_cache_version,
+      cache_profile,
+      std.join(', ', ["'" + p + tree + file + "'" for tree in ['', 'OSS/'] for file in [
+        'opam-lockfiles/*.locked',
+        '*.opam',
+        'dev/required.opam',
+        'libs/ocaml-tree-sitter-semgrep/core/tree-sitter.opam',
+        'cli/src/semgrep/semgrep_interfaces/semgrep-interfaces.opam',
+      ]]),
+    ],
   },
 };
 
@@ -234,6 +278,13 @@ local build_bundle_steps =
     },
   ];
 
+// brew fails re-taking the openssl@3 lock when linking openssl@4 in one process.
+// Run before any `brew install`, incl. opam depexts (`make install-deps`).
+local brew_unlink_openssl_step = {
+  name: 'Unlink openssl@3 (brew lock workaround)',
+  run: 'brew unlink openssl@3 || true',
+};
+
 local build_test_steps(opam_switch=opam_switch_default, name='semgrep-core', build_bundle=false, extra_env={}) =
   [
     opam_setup(opam_switch),
@@ -256,58 +307,48 @@ local build_test_steps(opam_switch=opam_switch_default, name='semgrep-core', bui
 
 local is_windows_arch(arch) = std.findSubstr('windows', arch) != [];
 local bin_ext(arch) = if is_windows_arch(arch) then '.exe' else '';
-local archive_ext(arch) = if is_windows_arch(arch) then '.tgz' else '.zip';
 local wheel_name(arch, pro=false) = 'wheel-%s%s' % [arch, if pro then '-pro' else ''];
 
 //TODO always want to include semgrep pro ...
-local build_wheel_steps(arch, copy_semgrep_pro=false) =
+local build_wheel_steps(arch, copy_semgrep_pro=false, root='.') =
+  local in_root(p) = if root == '.' then p else '%s/%s' % [root, p];
+  local bin_dir = in_root('cli/src/semgrep/bin');
+  local run_in_root(step) = if root == '.' then step else step { 'working-directory': root };
   [
     actions.setup_python_step(),
-    {
-      name: 'Untar artifacts',
-      run: |||
-        tar xvfz artifacts.tgz
-      |||,
-    },
   ] +
   (if !copy_semgrep_pro then [{
      name: 'Remove pro binary',
      run: '(rm artifacts/semgrep-core-proprietary%s && rm artifacts/pro-installed-by.txt) || true' % bin_ext(arch),
    }] else []) +
+  // actions/download-artifact does not preserve the executable bit (the
+  // tar-based flow we replaced did), so restore it before the binary is
+  // executed or packed into the wheel.
+  (if is_windows_arch(arch) then [] else [{
+     name: 'Restore executable bit on artifacts',
+     run: 'chmod +x artifacts/semgrep-core*',
+   }]) +
   [
     {
       name: 'Copy artifacts to wheel',
-      run: 'cp -LR artifacts/* cli/src/semgrep/bin',
+      run: 'cp -LR artifacts/* %s' % bin_dir,
     },
     {
       name: 'Clean up old artifacts',
-      run: 'rm -rf artifacts artifacts.tgz',
+      run: 'rm -rf artifacts',
     },
   ] +
   (if copy_semgrep_pro then [{
      name: 'Create pro-installed-by.txt',
-     run: 'test -f cli/src/semgrep/bin/pro-installed-by.txt || cli/src/semgrep/bin/semgrep-core-proprietary%s -pro_version > cli/src/semgrep/bin/pro-installed-by.txt' % bin_ext(arch),
+     run: 'test -f %(bin)s/pro-installed-by.txt || %(bin)s/semgrep-core-proprietary%(ext)s -pro_version > %(bin)s/pro-installed-by.txt' % { bin: bin_dir, ext: bin_ext(arch) },
    }] else []) +
   [
-    {
+    run_in_root({
       name: 'Build wheel',
       run: './scripts/build-wheels.sh',
-    },
-    actions.make_artifact_step('cli/dist%s' % archive_ext(arch)),
-    actions.upload_artifact_step(wheel_name(arch, pro=copy_semgrep_pro)),
+    }),
+    actions.upload_artifact_step(wheel_name(arch, pro=copy_semgrep_pro), in_root('cli/dist')),
   ];
-
-local unpack_wheel_steps = [
-
-  {
-    name: 'Unpack artifact',
-    run: 'tar xzvf artifacts.tgz',
-  },
-  {
-    name: 'Unpack wheel',
-    run: 'tar --wildcards -xzf ./artifacts/dist.tgz "*.whl" || unzip ./artifacts/dist.zip "*.whl"',
-  },
-];
 
 // Only retags the SMS image, we have to do this via ecr
 local retag_sms_docker_image_step(version, tag, dry_run=false) = {
@@ -342,8 +383,7 @@ local trigger_build_sms_docker_image_step(tag, use_nightly_repo='false') = {
 local test_wheel_steps(arch, copy_semgrep_pro=false) = [
   // caching is hard and why complicate things
   actions.setup_python_step(cache=false),
-  actions.download_artifact_step(wheel_name(arch, pro=copy_semgrep_pro)),
-] + unpack_wheel_steps + [
+  actions.download_artifact_step(wheel_name(arch, pro=copy_semgrep_pro), path='dist'),
   {
     name: 'install package',
     run: 'uv venv && uv pip install dist/*.whl',
@@ -387,9 +427,9 @@ local test_wheel_steps(arch, copy_semgrep_pro=false) = [
   opam_switch: opam_switch,
   opam_setup: opam_setup,
   build_test_steps: build_test_steps,
+  brew_unlink_openssl_step: brew_unlink_openssl_step,
   build_wheel_steps: build_wheel_steps,
   test_wheel_steps: test_wheel_steps,
-  unpack_wheel_steps: unpack_wheel_steps,
   retag_sms_docker_image_step: retag_sms_docker_image_step,
   trigger_build_sms_docker_image_step: trigger_build_sms_docker_image_step,
   wheel_name: wheel_name,

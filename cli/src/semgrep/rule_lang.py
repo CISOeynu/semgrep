@@ -14,6 +14,7 @@ import json
 import os
 import re
 from contextlib import contextmanager
+from enum import Enum
 from io import StringIO
 from pathlib import Path
 from tempfile import mkstemp
@@ -66,6 +67,24 @@ logger = getLogger(__name__)
 
 class EmptyYamlException(Exception):
     pass
+
+
+class RuleValidationMode(Enum):
+    """How aggressively to pre-validate rule files in Python before the scan.
+
+    The scan subprocess always re-parses rules, so pre-validation is best-effort
+    fail-fast. Modes:
+      FULL      — semgrep-core RPC validation, with Python jsonschema fallback
+                  on RPC failure (to produce nicer error messages with YAML
+                  line/column info). Default.
+      CORE_ONLY — semgrep-core RPC validation only; RPC errors surface as-is.
+      NONE      — skip all pre-validation; rule errors will instead be reported
+                  by the scan subprocess.
+    """
+
+    FULL = "full"
+    CORE_ONLY = "core_only"
+    NONE = "none"
 
 
 class RuleSchema:
@@ -206,14 +225,11 @@ class YamlMap:
         return self._internal.keys()
 
 
-def parse_yaml_preserve_spans(
+def _span_preserving_yaml_loader(
     contents: str, filename: Optional[str], allow_null: bool = False
-) -> Optional[YamlTree]:
+) -> YAML:
     """
-    parse yaml into a YamlTree object. The resulting spans are tracked in SourceTracker
-    so they can be used later when constructing error messages or displaying context.
-
-    :raise jsonschema.exceptions.SchemaError: if config is invalid
+    Build a YAML loader that produces YamlTree nodes with spans tracked in SourceTracker.
     """
 
     source_hash = SourceTracker.add_source(contents)
@@ -279,6 +295,19 @@ def parse_yaml_preserve_spans(
 
     yaml = YAML()
     yaml.Constructor = SpanPreservingRuamelConstructor
+    return yaml
+
+
+def parse_yaml_preserve_spans(
+    contents: str, filename: Optional[str], allow_null: bool = False
+) -> Optional[YamlTree]:
+    """
+    parse yaml into a YamlTree object. The resulting spans are tracked in SourceTracker
+    so they can be used later when constructing error messages or displaying context.
+
+    :raise jsonschema.exceptions.SchemaError: if config is invalid
+    """
+    yaml = _span_preserving_yaml_loader(contents, filename, allow_null)
     data = yaml.load(StringIO(contents))
     if data is None:
         return None
@@ -288,6 +317,27 @@ def parse_yaml_preserve_spans(
             f"Something went wrong parsing Yaml (expected a YamlTree as output, but got {type(data).__name__}): {PLEASE_FILE_ISSUE_TEXT}"
         )
     return data
+
+
+def parse_yamls_preserve_spans(
+    contents: str, filename: Optional[str], allow_null: bool = False
+) -> List[YamlTree]:
+    """
+    Parse a multi-document YAML stream into one YamlTree per non-null document.
+    """
+    yaml = _span_preserving_yaml_loader(contents, filename, allow_null)
+    documents = []
+    for data in yaml.load_all(StringIO(contents)):  # type: ignore ## missing from ruamel stub
+        if data is None:
+            continue
+        if not isinstance(data, YamlTree):
+            raise Exception(
+                f"Something went wrong parsing Yaml (expected a YamlTree as output, but got {type(data).__name__}): {PLEASE_FILE_ISSUE_TEXT}"
+            )
+        if data.value is None:
+            continue
+        documents.append(data)
+    return documents
 
 
 def has_patterns_key(raw_rule: Dict[str, Any]) -> bool:
@@ -606,7 +656,7 @@ def maybe_raise_from_rpc_error(
     """Lift an RPC validation failure into a user-facing schema error.
 
     Used by callers that don't want to fall back to Python's jsonschema
-    validation (i.e. --x-no-python-schema-validation). Swallows error kinds
+    validation (RuleValidationMode.CORE_ONLY). Swallows error kinds
     that are handled elsewhere (invalid regex, invalid language) and
     non-actionable severities. Re-raises NotImplementedError as-is since it
     indicates an RPC infrastructure problem.
@@ -719,11 +769,11 @@ def validate_via_rpc_with_fallback(
     yaml_tree: Optional[YamlTree],
     source_hash: SourceFileHash,
     filename: Optional[str],
-    no_python_schema_validation: bool,
+    mode: RuleValidationMode,
 ) -> None:
-    """Validate `contents` via the semgrep-core RPC, falling back to Python
-    jsonschema validation on RPC failure unless `no_python_schema_validation`
-    is set (in which case the RPC failure surfaces directly).
+    """Validate `contents` via the semgrep-core RPC. When `mode` is FULL, fall
+    back to Python jsonschema validation on RPC failure to produce nicer error
+    messages; when CORE_ONLY, surface the RPC failure directly.
     """
     suffix = ".json" if is_json else ".yaml"
     with rules_temp_file(contents, suffix) as tmp_path:
@@ -731,7 +781,7 @@ def validate_via_rpc_with_fallback(
             run_rpc_validate_exn(rules_tmp_path=tmp_path)
             logger.debug("RPC validation succeeded")
         except (RpcValidationError, NotImplementedError) as e:
-            if no_python_schema_validation:
+            if mode is RuleValidationMode.CORE_ONLY:
                 maybe_raise_from_rpc_error(e, source_hash, filename)
                 return
             error_type = (

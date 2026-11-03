@@ -15,12 +15,10 @@ authors = [
   { name = "Semgrep Inc.", email = "support@semgrep.com" }
 ]
 name = "semgrep"
-version = "1.164.0"
+version = "1.183.0"
 description = "Lightweight static analysis for many languages. Find bug variants with patterns that look like source code."
-# Since our readme lives outside of the project root (i.e in ../), and we do
-# some dynamic logic in `setup.py`, we need to declare the field as dynamic
-# here
-dynamic = ["readme"]
+# README.md is a symlink to the canonical ../README.md.
+readme = "README.md"
 requires-python = ">=3.10"
 license = "LGPL-2.1-or-later"
 license-files = ["LICENSE"]
@@ -58,13 +56,14 @@ classifiers = [
 dependencies = [
   "attrs>=21.3",
   "boltons~=21.0",
+  "certifi>=2026.10.19",
   "click-option-group~=0.5",
-  "click~=8.1.8",
+  "click~=8.4.2",
   "colorama~=0.4.0",
   "exceptiongroup~=1.2.0",
   "glom>=23.3",
   "jsonschema~=4.25.1",
-  "mcp==1.23.3",
+  "mcp==1.29.0",
   "opentelemetry-api~=1.37.0",
   "opentelemetry-sdk~=1.37.0",
   "opentelemetry-exporter-otlp-proto-http~=1.37.0",
@@ -72,7 +71,7 @@ dependencies = [
   "opentelemetry-instrumentation-threading~=0.58b0",
   "packaging>=21.0",
   "peewee~=3.14",
-  "pyjwt[crypto]~=2.12.0",
+  "pyjwt[crypto]>=2.15.0,<3",
   "requests~=2.22",
   "rich>=13.5.2",
   "ruamel.yaml>=0.18.15",
@@ -119,7 +118,7 @@ dev = [
   "bytecode",
 ]
 
-# This is used in pypi-release.yml so that we can execute `setup.py park`
+# Required by `setup.py park`.
 build = [
   "setuptools",
 ]
@@ -175,5 +174,7 @@ markers = [
 asyncio_mode = "auto"
 
 [tool.uv]
-exclude-newer = "1 week"
-required-version = ">=0.10.0"
+exclude-newer = "1 week"  # nosemgrep: uv-missing-dependency-cooldown -- "1 week" == 7-day cooldown (SEC-1765); rule only matches "N days"
+# Remove after 2026-10-27, when the patched certifi release exits the normal cooldown.
+exclude-newer-package = { certifi = "2026-10-21T00:00:00Z" }
+required-version = ">=0.13.4"

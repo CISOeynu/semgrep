@@ -589,7 +589,10 @@ let options (actions : unit -> Arg_.cmdline_actions) =
       ( "-version",
         Arg.Unit
           (fun () ->
-            let version = spf "semgrep-core version: %s" Version.version in
+            let version =
+              spf "semgrep-core version: %s (%s)" Version.version
+                Git_info.commit
+            in
             UConsole.print version;
             Core_exit_code.(exit_semgrep Success)),
         "  guess what" );
@@ -642,10 +645,7 @@ let register_unix_exn_printers () =
 *)
 let register_exception_printers () =
   register_stdlib_exn_printers ();
-  register_unix_exn_printers ();
-  Pcre2_.register_exception_printer ();
-  Pcre_.register_exception_printer ()
-[@@alert "-deprecated"]
+  register_unix_exn_printers ()
 
 (*****************************************************************************)
 (* Run a scan *)
@@ -675,6 +675,17 @@ let maybe_with_eio ?rules (f : Core_scan_config.t -> 'a) : 'a =
         Logs_threaded.enable ();
         f { config with par_conf = Parallelism_config.create env })
 
+let curl_telemetry_supported (kernel : Platform.kernel) : bool =
+  (* Curl TLS bypasses Ca_certs.authenticator. On macOS and Windows we cannot
+     ensure its trust store excludes compromised eMudhra roots, so disable it.
+     Linux relies on patched host/image CA stores. *)
+  match kernel with
+  | Linux -> true
+  | Darwin
+  | Windows
+  | OtherKernel _ ->
+      false
+
 let maybe_with_tracing function_name engine analysis_flags
     (config : Core_scan_config.t) (f : Core_scan_config.t -> 'a) : 'a =
   match config.telemetry with
@@ -688,9 +699,9 @@ let maybe_with_tracing function_name engine analysis_flags
           ~jobs:(Core_scan_config.finalize_num_jobs config.num_jobs)
           ~eio ()
       in
-      let configure_otel ?eio_sw_base () =
-        Telemetry.configure_otel ?eio_sw_base ~attrs:resource_attrs
-          "semgrep-core" tracing.endpoint
+      let configure_otel ?eio_sw_base ?curl_supported () =
+        Telemetry.configure_otel ?eio_sw_base ?curl_supported
+          ~attrs:resource_attrs "semgrep-core" tracing.endpoint
       in
       let run () =
         if is_rpc_call () then
@@ -703,7 +714,9 @@ let maybe_with_tracing function_name engine analysis_flags
               f { config with telemetry = Some telemetry })
       in
       if not eio then (
-        configure_otel ();
+        configure_otel
+          ~curl_supported:(curl_telemetry_supported (Platform.kernel ()))
+          ();
         run ())
       else
         Eio.Switch.run (fun sw ->
@@ -771,12 +784,19 @@ let main_exn (argv : string array) : unit =
     ~level
   @@ fun () ->
   Logs.info (fun m -> m "Executed as: %s" (argv |> String.concat " "));
-  Logs.info (fun m -> m "Version: %s" Version.version);
+  Logs.info (fun m -> m "Version: %s (%s)" Version.version Git_info.commit);
 
   (* coupling: if you add an init() call here, you probably need to modify
      also tests/Test.ml, CLI.ml, and Pro_core_CLI.ml
   *)
-  Proxy.configure_proxy (Proxy.settings_from_env ());
+  (match Proxy.settings_from_env () with
+  | Ok proxy_settings -> Proxy.configure_proxy proxy_settings
+  | Error (`Msg msg) ->
+      (* Passing an invalid proxy URI to [configure_proxy] raises
+       * [Invalid_argument] out of cohttp, so report [msg], which names the
+       * offending variable, and exit instead. *)
+      Logs.err (fun m -> m "%s" msg);
+      Core_exit_code.(exit_semgrep Bad_command_line));
   Http_helpers.set_client_ref (module Cohttp_lwt_unix.Client);
 
   (* must be done after Arg.parse, because Common.profile is set by it *)

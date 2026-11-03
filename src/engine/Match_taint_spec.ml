@@ -180,6 +180,7 @@ let mk_synthetic_rwm ~(rule : R.t) ~(lang : Lang.t)
           fix_regexp = None;
           langs = [ lang ];
           pattern_string = "";
+          severity = Some rule.severity;
         };
       engine_of_match = `OSS;
       env = [];
@@ -346,6 +347,7 @@ let raw_spec_matches_of_taint_rule ~per_file_formula_cache xconf file
   let formula_cache = per_file_formula_cache in
   let xconf = Match_env.adjust_xconfig_with_rule_options xconf rule.options in
   let lazy_ast_and_errors = lazy_safe ast_and_errors in
+  let lazy_content = lazy_safe (UFile.read_file file) in
   (* TODO: should this function just take a target, rather than a file? *)
   let xtarget : Xtarget.t =
     {
@@ -355,7 +357,8 @@ let raw_spec_matches_of_taint_rule ~per_file_formula_cache xconf file
           internal_path_to_content = file;
         };
       analyzer = rule.target_analyzer;
-      lazy_content = lazy_safe (UFile.read_file file);
+      lazy_content;
+      lazy_utf8_valid = Lazy_safe.map String.is_valid_utf_8 lazy_content;
       lazy_ast_and_errors;
     }
   in
@@ -745,7 +748,7 @@ let preds_of_rule ~per_file_formula_cache ~(file : Taint_rule_inst.file) xconf
   (preds, stats, raw_spec_matches, expls)
 
 let taint_config_of_rule ~per_file_formula_cache ~(file : Taint_rule_inst.file)
-    ~(muts : Taint_rule_inst.mutable_state) xconf ast_and_errors rule =
+    xconf ast_and_errors rule =
   let preds, stats, raw_spec_matches, expls =
     preds_of_rule ~per_file_formula_cache ~file xconf ast_and_errors rule
   in
@@ -754,7 +757,6 @@ let taint_config_of_rule ~per_file_formula_cache ~(file : Taint_rule_inst.file)
   ( Taint_rule_inst.
       {
         file;
-        muts;
         rule = fst rule.id;
         options;
         track_control = rule_needs_to_track_control_taint rule;

@@ -91,12 +91,6 @@
 type datetime = Semgrep_output_v1_t.datetime
   [@@deriving ord]
 
-type dependency_child = Semgrep_output_v1_t.dependency_child = {
-  package: string;
-  version: string
-}
-  [@@deriving ord]
-
 type dependency_kind = Semgrep_output_v1_t.dependency_kind = 
     Direct
       (**
@@ -152,6 +146,24 @@ type ecosystem = Semgrep_output_v1_t.ecosystem =
   [@@deriving eq, ord, show { with_path = false }]
 
 type fpath = Semgrep_output_v1_t.fpath [@@deriving eq, ord, show]
+
+type dependency_child = Semgrep_output_v1_t.dependency_child = {
+  package: string;
+  version: string;
+  lockfile_path: fpath option
+    (**
+      Path of the file the child was reported from, set when the same package
+      and version can be reported from several files, e.g. one entry per
+      Gradle module build file. Together with package and version it
+      identifies the found_dependency this child refers to. Since 1.177.0
+    *)
+}
+  [@@deriving ord]
+
+type dependency_path = Semgrep_output_v1_t.dependency_path = {
+  nodes: dependency_child list
+}
+  [@@deriving ord]
 
 type found_dependency = Semgrep_output_v1_t.found_dependency = {
   package: string;
@@ -215,6 +227,11 @@ type lockfile_kind = Semgrep_output_v1_t.lockfile_kind =
   | MixLock
   | ConanLock
   | OpamLocked
+  | MavenInstallJson
+      (**
+        rules_jvm_external's pinned maven_install.json lockfile
+        https://github.com/bazel-contrib/rules_jvm_external
+      *)
 
   [@@deriving show { with_path = false }, eq, yojson]
 
@@ -318,6 +335,11 @@ type manifest_kind = Semgrep_output_v1_t.manifest_kind =
       *)
   | BuildSbt
       (** build.sbt - https://www.scala-sbt.org/1.x/docs/Basic-Def.html *)
+  | ModuleBazel
+      (**
+        MODULE.bazel or WORKSPACE(.bazel) marks the root of a Bazel
+        workspace. https://bazel.build/external/module
+      *)
 
   [@@deriving show { with_path = false }, eq]
 
@@ -487,7 +509,18 @@ type sca_pattern = Semgrep_output_v1_t.sca_pattern = {
 type dependency_match = Semgrep_output_v1_t.dependency_match = {
   dependency_pattern: sca_pattern;
   found_dependency: found_dependency;
-  lockfile: fpath
+  lockfile: fpath;
+  dependency_paths: dependency_path list option
+    (**
+      All known dependency paths by which the matched (transitive) dependency
+      was introduced into the project. Each path is ordered from the direct
+      dependency that introduced it (node 0) to the matched (transitive)
+      dependency (last node). Computed locally from the resolved dependency
+      graph at scan time; only populated when dependency-graph
+      (path-to-transitivity) resolution ran for the ecosystem. Empty/absent
+      for direct dependencies or ecosystems without graph resolution. The
+      number of paths per match is capped. EXPERIMENTAL since 1.166.0
+    *)
 }
   [@@deriving ord]
 
@@ -939,6 +972,13 @@ type resolution_cmd_failed = Semgrep_output_v1_t.resolution_cmd_failed = {
 }
   [@@deriving show]
 
+type incomplete_dependency_resolution =
+  Semgrep_output_v1_t.incomplete_dependency_resolution = {
+  command: string;
+  message: string
+}
+  [@@deriving show]
+
 type resolution_error_kind = Semgrep_output_v1_t.resolution_error_kind = 
     UnsupportedManifest
   | MissingRequirement of string
@@ -953,10 +993,13 @@ type resolution_error_kind = Semgrep_output_v1_t.resolution_error_kind =
         a lockfile parser failed since semgrep 1.109.0 (to replace
         dependency_parser_error)
       *)
-  | ResourceInaccessible of resource_inaccessible
+  | IncompleteDependencyResolution of incomplete_dependency_resolution
       (**
-        unable to access private registry, likely due to missing credentials
+        the dependency manager succeeded but returned an incomplete
+        dependency graph
       *)
+  | ResourceInaccessible of resource_inaccessible
+      (** unable to retrieve a dependency from a registry *)
 
   [@@deriving show]
 
@@ -1270,6 +1313,7 @@ type targeting_conf = Semgrep_output_v1_t.targeting_conf = {
     *);
   force_novcs_project: bool;
   exclude_minified_files: bool;
+  include_binary_files: bool;
   baseline_commit: string option
 }
   [@@deriving show]
@@ -1591,6 +1635,27 @@ type subproject_resolution_plan =
   subprojects: single_subproject_plan list
 }
 
+(**
+  A subproject that was deliberately not resolved, and so contributed no
+  entries to [ci_scan_dependencies].
+  
+  This is deliberately not [unresolved_subproject]: that type embeds the
+  recursive [dependency_source] variant, which serializes to awkward nested
+  JSON.
+*)
+type skipped_subproject = Semgrep_output_v1_t.skipped_subproject = {
+  root_dir: fpath (** usually the directory of the manifest file *);
+  dependency_sources: dependency_source_file list
+    (**
+      The files that would have been used to resolve this subproject, one
+      entry per file. Each entry is tagged as a lockfile or a manifest so
+      that it can be matched against the corresponding field of
+      [found_dependency]. A subproject with several lockfiles
+      (MultiLockfile), or one with both a manifest and a lockfile, produces
+      several entries.
+    *)
+}
+
 type skipped_rule = Semgrep_output_v1_t.skipped_rule = {
   rule_id: rule_id;
   details: string;
@@ -1637,6 +1702,11 @@ type scan_configuration = Semgrep_output_v1_t.scan_configuration = {
       From 1.126.0. Customers in FIPS environments have specific hash
       function requirements that this flag will override. See SAF-2057 for
       details.
+    *);
+  nosemgrep_disabled: bool
+    (**
+      From 1.166.0. Org-wide setting (deployment.nosemgrep_disabled) that
+      disables 'nosemgrep' inline ignore comments for the scan.
     *)
 }
 
@@ -1677,6 +1747,11 @@ type engine_configuration = Semgrep_output_v1_t.engine_configuration = {
     *);
   ignored_files: string list;
   product_ignored_files: product_ignored_files option (** from 1.71.0 *);
+  gradle_module_attribution: bool
+    (**
+      Report Gradle dependencies at their module build files. Disabled by
+      default during rollout.
+    *);
   generic_slow_rollout: bool
     (** for features we only want to turn on for select customers *);
   historical_config: historical_configuration option (** from 1.63.0 *);
@@ -1714,6 +1789,15 @@ type scan_metadata = Semgrep_output_v1_t.scan_metadata = {
     (**
       Override to enable malicious dependency rules for this scan, even if
       disabled at the deployment level.
+    *);
+  partial_scan_rule_ids: rule_id list option
+    (**
+      If set, the backend should filter the generated scan config down to
+      only these rule IDs. Used by Semgrep Managed Scanning to run fast
+      supply-chain incident scans for a small set of rules. Absent means a
+      normal full scan. Acts as a filter on the config that would otherwise
+      be produced: rules not normally included for this scan will still not
+      run.
     *)
 }
 
@@ -1809,6 +1893,30 @@ type scan_request = Semgrep_output_v1_t.scan_request = {
   project_metadata: project_metadata;
   scan_metadata: scan_metadata;
   project_config: ci_config_from_repo option
+}
+
+(**
+  Parameters for CallScan.
+  
+  Unlike the rest of this section, this is an EXTERNAL contract: it is
+  vendored by Guardian's fragment scanner rather than used by pysemgrep.
+  Breaking changes are allowed and to be expected.
+*)
+type scan_params = Semgrep_output_v1_t.scan_params = {
+  rules: fpath
+    (** Path to a file containing the rules, as for CallValidate. *);
+  targets: fpath
+    (** Path to a file containing a 'targets' value, as for -targets. *);
+  timeout: float
+    (**
+      Maximum time to spend running one rule on one file, in seconds. 0
+      disables the timeout.
+    *);
+  timeout_threshold: int
+    (**
+      Number of rules that may time out on a file before the file is skipped.
+      0 disables the threshold.
+    *)
 }
 
 type ci_env = Semgrep_output_v1_t.ci_env
@@ -1929,6 +2037,11 @@ type resolve_dependencies_params =
   download_dependency_source_code: bool;
   allow_local_builds: bool
     (** whether to allow executing package manager commands *);
+  gradle_module_attribution: bool
+    (**
+      Preserve Gradle module dependency instances and build-file paths in
+      resolution results.
+    *);
   package_manager_env: (string * string) list option
     (**
       extra environment variables to pass to package manager subprocesses
@@ -2347,6 +2460,21 @@ type ci_scan_results = Semgrep_output_v1_t.ci_scan_results = {
       since semgrep 1.38.0. This data was originally sent to /complete, but
       we want to start sending it to /results
     *);
+  skipped_subprojects: skipped_subproject list option
+    (**
+      since semgrep 1.173.0. Subprojects whose dependencies were not
+      resolved, and so are absent from [dependencies]. The app should NOT
+      treat the dependencies of these subprojects as removed. Absent (rather
+      than empty) when sent by a CLI too old to report this, which is not the
+      same as a scan where nothing was skipped.
+    *);
+  changed_dependency_sources: fpath list option
+    (**
+      since semgrep 1.174.0. The dependency sources (lockfiles or manifests)
+      that the diff scan added or modified relative to the merge base. Empty
+      when the diff scan touched no dependency source. Absent on full scans,
+      since there is no base to compare against.
+    *);
   metadata: ci_scan_metadata option
     (**
       filled in by the backend to associate scan results with the driving
@@ -2396,7 +2524,20 @@ type ci_scan_complete = Semgrep_output_v1_t.ci_scan_complete = {
   exit_code: int;
   stats: ci_scan_complete_stats;
   dependencies: ci_scan_dependencies option;
+  skipped_subprojects: skipped_subproject list option
+    (**
+      since semgrep 1.173.0. See the identically-named field in
+      [ci_scan_results]. Sent to both endpoints for the same reason
+      [dependencies] is.
+    *);
   dependency_parser_errors: dependency_parser_error list option;
+  changed_dependency_sources: fpath list option
+    (**
+      since semgrep 1.174.0 The dependency sources (lockfiles or manifests)
+      that the diff scan added or modified relative to the merge base. Empty
+      when the diff scan touched no dependency source. Absent on full scans,
+      since there is no base to compare against.
+    *);
   task_id: string option (** since 1.31.0 *);
   final_attempt: bool option
 }
@@ -2430,6 +2571,48 @@ type get_config_response_v2 = Semgrep_output_v1_t.get_config_response_v2 = {
   polling: polling_information option;
   config: scan_configuration option;
   engine_params: engine_configuration option
+}
+
+type core_output = Semgrep_output_v1_t.core_output = {
+  version: version;
+  results: core_match list;
+  errors: core_error list
+    (** errors are guaranteed to be duplicate free; see also Report.ml *);
+  paths: scanned_and_skipped (** targeting information *);
+  time: profile option (** profiling information *);
+  explanations: matching_explanation list option
+    (**
+      debugging (rule writing) information. Note that as opposed to the
+      dataflow trace, the explanations are not embedded inside a match
+      because we give also explanations when things are not matching.
+      EXPERIMENTAL: since semgrep 0.109
+    *);
+  rules_by_engine: rule_id_and_engine_kind list option
+    (**
+      These rules, classified by engine used, will let us be transparent in
+      the CLI output over what rules were run with what. EXPERIMENTAL: since:
+      1.11.0
+    *);
+  engine_requested: engine_kind option;
+  interfile_languages_used: string list option
+    (**
+      Reporting just the requested engine isn't granular enough. We want to
+      know what languages had rules that invoked interfile. This is
+      particularly important for tracking the performance impact of new
+      interfile languages EXPERIMENTAL: since 1.49.0
+    *);
+  skipped_rules: skipped_rule list (** EXPERIMENTAL: since: 1.37.0 *);
+  subprojects: cli_output_subproject_info list option
+    (**
+      SCA subproject resolution results. Note: this is only available when
+      logged in. EXPERIMENTAL: since: 1.125.0
+    *);
+  mcp_scan_results: mcp_scan_results option (** MCP scan results. *);
+  profiling_results: profiling_entry list
+    (**
+      How long it took to execute this or that piece of code in semgrep-core
+    *);
+  symbol_analysis: symbol_analysis option (** since semgrep 1.108.0 *)
 }
 
 type apply_fixes_return = Semgrep_output_v1_t.apply_fixes_return = {
@@ -2536,48 +2719,6 @@ type core_output_extra = Semgrep_output_v1_t.core_output_extra = {
   symbol_analysis: symbol_analysis option (** since semgrep 1.108.0 *)
 }
 
-type core_output = Semgrep_output_v1_t.core_output = {
-  version: version;
-  results: core_match list;
-  errors: core_error list
-    (** errors are guaranteed to be duplicate free; see also Report.ml *);
-  paths: scanned_and_skipped (** targeting information *);
-  time: profile option (** profiling information *);
-  explanations: matching_explanation list option
-    (**
-      debugging (rule writing) information. Note that as opposed to the
-      dataflow trace, the explanations are not embedded inside a match
-      because we give also explanations when things are not matching.
-      EXPERIMENTAL: since semgrep 0.109
-    *);
-  rules_by_engine: rule_id_and_engine_kind list option
-    (**
-      These rules, classified by engine used, will let us be transparent in
-      the CLI output over what rules were run with what. EXPERIMENTAL: since:
-      1.11.0
-    *);
-  engine_requested: engine_kind option;
-  interfile_languages_used: string list option
-    (**
-      Reporting just the requested engine isn't granular enough. We want to
-      know what languages had rules that invoked interfile. This is
-      particularly important for tracking the performance impact of new
-      interfile languages EXPERIMENTAL: since 1.49.0
-    *);
-  skipped_rules: skipped_rule list (** EXPERIMENTAL: since: 1.37.0 *);
-  subprojects: cli_output_subproject_info list option
-    (**
-      SCA subproject resolution results. Note: this is only available when
-      logged in. EXPERIMENTAL: since: 1.125.0
-    *);
-  mcp_scan_results: mcp_scan_results option (** MCP scan results. *);
-  profiling_results: profiling_entry list
-    (**
-      How long it took to execute this or that piece of code in semgrep-core
-    *);
-  symbol_analysis: symbol_analysis option (** since semgrep 1.108.0 *)
-}
-
 type cli_output_extra = Semgrep_output_v1_t.cli_output_extra = {
   paths: scanned_and_skipped (** targeting information *);
   time: profile option (** profiling information *);
@@ -2663,26 +2804,6 @@ val datetime_of_string :
   string -> datetime
   (** Deserialize JSON data of type {!type:datetime}. *)
 
-val write_dependency_child :
-  Buffer.t -> dependency_child -> unit
-  (** Output a JSON value of type {!type:dependency_child}. *)
-
-val string_of_dependency_child :
-  ?len:int -> dependency_child -> string
-  (** Serialize a value of type {!type:dependency_child}
-      into a JSON string.
-      @param len specifies the initial length
-                 of the buffer used internally.
-                 Default: 1024. *)
-
-val read_dependency_child :
-  Yojson.Safe.lexer_state -> Lexing.lexbuf -> dependency_child
-  (** Input JSON data of type {!type:dependency_child}. *)
-
-val dependency_child_of_string :
-  string -> dependency_child
-  (** Deserialize JSON data of type {!type:dependency_child}. *)
-
 val write_dependency_kind :
   Buffer.t -> dependency_kind -> unit
   (** Output a JSON value of type {!type:dependency_kind}. *)
@@ -2742,6 +2863,46 @@ val read_fpath :
 val fpath_of_string :
   string -> fpath
   (** Deserialize JSON data of type {!type:fpath}. *)
+
+val write_dependency_child :
+  Buffer.t -> dependency_child -> unit
+  (** Output a JSON value of type {!type:dependency_child}. *)
+
+val string_of_dependency_child :
+  ?len:int -> dependency_child -> string
+  (** Serialize a value of type {!type:dependency_child}
+      into a JSON string.
+      @param len specifies the initial length
+                 of the buffer used internally.
+                 Default: 1024. *)
+
+val read_dependency_child :
+  Yojson.Safe.lexer_state -> Lexing.lexbuf -> dependency_child
+  (** Input JSON data of type {!type:dependency_child}. *)
+
+val dependency_child_of_string :
+  string -> dependency_child
+  (** Deserialize JSON data of type {!type:dependency_child}. *)
+
+val write_dependency_path :
+  Buffer.t -> dependency_path -> unit
+  (** Output a JSON value of type {!type:dependency_path}. *)
+
+val string_of_dependency_path :
+  ?len:int -> dependency_path -> string
+  (** Serialize a value of type {!type:dependency_path}
+      into a JSON string.
+      @param len specifies the initial length
+                 of the buffer used internally.
+                 Default: 1024. *)
+
+val read_dependency_path :
+  Yojson.Safe.lexer_state -> Lexing.lexbuf -> dependency_path
+  (** Input JSON data of type {!type:dependency_path}. *)
+
+val dependency_path_of_string :
+  string -> dependency_path
+  (** Deserialize JSON data of type {!type:dependency_path}. *)
 
 val write_found_dependency :
   Buffer.t -> found_dependency -> unit
@@ -3782,6 +3943,26 @@ val read_resolution_cmd_failed :
 val resolution_cmd_failed_of_string :
   string -> resolution_cmd_failed
   (** Deserialize JSON data of type {!type:resolution_cmd_failed}. *)
+
+val write_incomplete_dependency_resolution :
+  Buffer.t -> incomplete_dependency_resolution -> unit
+  (** Output a JSON value of type {!type:incomplete_dependency_resolution}. *)
+
+val string_of_incomplete_dependency_resolution :
+  ?len:int -> incomplete_dependency_resolution -> string
+  (** Serialize a value of type {!type:incomplete_dependency_resolution}
+      into a JSON string.
+      @param len specifies the initial length
+                 of the buffer used internally.
+                 Default: 1024. *)
+
+val read_incomplete_dependency_resolution :
+  Yojson.Safe.lexer_state -> Lexing.lexbuf -> incomplete_dependency_resolution
+  (** Input JSON data of type {!type:incomplete_dependency_resolution}. *)
+
+val incomplete_dependency_resolution_of_string :
+  string -> incomplete_dependency_resolution
+  (** Deserialize JSON data of type {!type:incomplete_dependency_resolution}. *)
 
 val write_resolution_error_kind :
   Buffer.t -> resolution_error_kind -> unit
@@ -5063,6 +5244,26 @@ val subproject_resolution_plan_of_string :
   string -> subproject_resolution_plan
   (** Deserialize JSON data of type {!type:subproject_resolution_plan}. *)
 
+val write_skipped_subproject :
+  Buffer.t -> skipped_subproject -> unit
+  (** Output a JSON value of type {!type:skipped_subproject}. *)
+
+val string_of_skipped_subproject :
+  ?len:int -> skipped_subproject -> string
+  (** Serialize a value of type {!type:skipped_subproject}
+      into a JSON string.
+      @param len specifies the initial length
+                 of the buffer used internally.
+                 Default: 1024. *)
+
+val read_skipped_subproject :
+  Yojson.Safe.lexer_state -> Lexing.lexbuf -> skipped_subproject
+  (** Input JSON data of type {!type:skipped_subproject}. *)
+
+val skipped_subproject_of_string :
+  string -> skipped_subproject
+  (** Deserialize JSON data of type {!type:skipped_subproject}. *)
+
 val write_skipped_rule :
   Buffer.t -> skipped_rule -> unit
   (** Output a JSON value of type {!type:skipped_rule}. *)
@@ -5362,6 +5563,26 @@ val read_scan_request :
 val scan_request_of_string :
   string -> scan_request
   (** Deserialize JSON data of type {!type:scan_request}. *)
+
+val write_scan_params :
+  Buffer.t -> scan_params -> unit
+  (** Output a JSON value of type {!type:scan_params}. *)
+
+val string_of_scan_params :
+  ?len:int -> scan_params -> string
+  (** Serialize a value of type {!type:scan_params}
+      into a JSON string.
+      @param len specifies the initial length
+                 of the buffer used internally.
+                 Default: 1024. *)
+
+val read_scan_params :
+  Yojson.Safe.lexer_state -> Lexing.lexbuf -> scan_params
+  (** Input JSON data of type {!type:scan_params}. *)
+
+val scan_params_of_string :
+  string -> scan_params
+  (** Deserialize JSON data of type {!type:scan_params}. *)
 
 val write_ci_env :
   Buffer.t -> ci_env -> unit
@@ -6303,6 +6524,26 @@ val get_config_response_v2_of_string :
   string -> get_config_response_v2
   (** Deserialize JSON data of type {!type:get_config_response_v2}. *)
 
+val write_core_output :
+  Buffer.t -> core_output -> unit
+  (** Output a JSON value of type {!type:core_output}. *)
+
+val string_of_core_output :
+  ?len:int -> core_output -> string
+  (** Serialize a value of type {!type:core_output}
+      into a JSON string.
+      @param len specifies the initial length
+                 of the buffer used internally.
+                 Default: 1024. *)
+
+val read_core_output :
+  Yojson.Safe.lexer_state -> Lexing.lexbuf -> core_output
+  (** Input JSON data of type {!type:core_output}. *)
+
+val core_output_of_string :
+  string -> core_output
+  (** Deserialize JSON data of type {!type:core_output}. *)
+
 val write_apply_fixes_return :
   Buffer.t -> apply_fixes_return -> unit
   (** Output a JSON value of type {!type:apply_fixes_return}. *)
@@ -6522,26 +6763,6 @@ val read_core_output_extra :
 val core_output_extra_of_string :
   string -> core_output_extra
   (** Deserialize JSON data of type {!type:core_output_extra}. *)
-
-val write_core_output :
-  Buffer.t -> core_output -> unit
-  (** Output a JSON value of type {!type:core_output}. *)
-
-val string_of_core_output :
-  ?len:int -> core_output -> string
-  (** Serialize a value of type {!type:core_output}
-      into a JSON string.
-      @param len specifies the initial length
-                 of the buffer used internally.
-                 Default: 1024. *)
-
-val read_core_output :
-  Yojson.Safe.lexer_state -> Lexing.lexbuf -> core_output
-  (** Input JSON data of type {!type:core_output}. *)
-
-val core_output_of_string :
-  string -> core_output
-  (** Deserialize JSON data of type {!type:core_output}. *)
 
 val write_cli_output_extra :
   Buffer.t -> cli_output_extra -> unit

@@ -11,9 +11,8 @@
    LICENSE for more details.
 *)
 (*
-   PCRE-related code used both for parsing patterns and for scanning targets.
+   PCRE2-related code used both for parsing patterns and for scanning targets.
 *)
-[@@@alert "-deprecated"]
 
 open Printf
 
@@ -69,7 +68,7 @@ let char_class_of_list ?(contents_only = false) chars =
    the extended mode in addition to other special characters.
 *)
 let quote =
-  let rex = Pcre_.regexp "[[:space:]#]" in
+  let rex = Pcre2_.compile_exn "[[:space:]#]" in
   let subst str =
     assert (String.length str = 1);
     (* escape all characters so that it works regardless of whether they're
@@ -79,4 +78,9 @@ let quote =
     | '\t' -> {|\t|}
     | c (* other whitespace or '#' *) -> sprintf {|\x%02X|} (Char.code c)
   in
-  fun str -> Pcre_.quote str |> Pcre_.substitute ~rex ~subst
+  fun str ->
+    (* On a match error (e.g. invalid UTF-8) fall back to the plain quoted
+       string rather than crashing; it is still a valid regex, only the
+       whitespace/'#' escaping is skipped. *)
+    let quoted = Pcre2_.quote str in
+    Pcre2_.replace_fn rex subst quoted |> Result.value ~default:quoted

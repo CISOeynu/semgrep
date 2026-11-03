@@ -57,7 +57,7 @@ type state = {
   (* When there is a 'return' we need to know the exit node to link to *)
   exiti : F.nodei;
   (* Attaches labels to nodes. *)
-  labels : (label_key, F.nodei) Hashtbl.t;
+  labels : (label_key, F.nodei) Base.Hashtbl.t;
   (* Gotos pending to be resolved, a list of Goto nodes and the label
    * to which they are jumping. *)
   gotos : (nodei * label_key) list ref;
@@ -100,12 +100,12 @@ let add_pending_goto state gotoi label =
 let label_node state labels nodei =
   labels
   |> List.iter (fun label ->
-      Hashtbl.add state.labels (key_of_label label) nodei)
+      Base.Hashtbl.set state.labels ~key:(key_of_label label) ~data:nodei)
 
 let resolve_gotos state =
   !(state.gotos)
   |> List.iter (fun (srci, label_key) ->
-      match Hashtbl.find_opt state.labels label_key with
+      match Base.Hashtbl.find state.labels label_key with
       | None ->
           let loc_str =
             match state.opt_tok with
@@ -372,12 +372,30 @@ let rec cfg_stmt : state -> F.nodei option -> stmt -> cfg_stmt_result =
       state.g |> add_arc_from_opt (previ, matchi);
       let nodes =
         List.map
-          (fun ({ pattern; body } : IL.pattern_branch) ->
-            let casei =
-              state.g#add_node (IL.mk_node (F.NCase (scrutinee, pattern)))
+          (fun ({ patterns; body } : IL.pattern_branch) ->
+            (* One 'NCase' per pattern; several patterns are routed through a
+             * 'Join' into a single shared copy of the body. *)
+            let body_previ =
+              match patterns with
+              | [ pattern ] ->
+                  let casei =
+                    state.g#add_node (IL.mk_node (F.NCase (scrutinee, pattern)))
+                  in
+                  state.g |> add_arc (matchi, casei);
+                  casei
+              | patterns ->
+                  let joini = state.g#add_node (IL.mk_node F.Join) in
+                  patterns
+                  |> List.iter (fun pattern ->
+                      let casei =
+                        state.g#add_node
+                          (IL.mk_node (F.NCase (scrutinee, pattern)))
+                      in
+                      state.g |> add_arc (matchi, casei);
+                      state.g |> add_arc (casei, joini));
+                  joini
             in
-            state.g |> add_arc (matchi, casei);
-            cfg_stmt_list state (Some casei) body)
+            cfg_stmt_list state (Some body_previ) body)
           branches
       in
       let throws =
@@ -487,7 +505,7 @@ and cfg_of_stmts ?tok (xs : stmt list) : IL.cfg * Fun_CFG.lambdas_cfgs =
       opt_tok = tok;
       g;
       exiti;
-      labels = Hashtbl.create 10;
+      labels = Base.Hashtbl.Poly.create ~size:10 ();
       gotos = ref [];
       throw_destination = None;
       lambdas_cfgs = ref Fun_CFG.empty_lambdas;

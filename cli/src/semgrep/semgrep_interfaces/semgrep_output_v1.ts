@@ -232,6 +232,7 @@ export type DependencyMatch = {
   dependency_pattern: ScaPattern;
   found_dependency: FoundDependency;
   lockfile: Fpath;
+  dependency_paths?: DependencyPath[];
 }
 
 export type ScaPattern = {
@@ -257,6 +258,11 @@ export type FoundDependency = {
 export type DependencyChild = {
   package_: string;
   version: string;
+  lockfile_path?: Fpath;
+}
+
+export type DependencyPath = {
+  nodes: DependencyChild[];
 }
 
 export type ValidationState =
@@ -637,6 +643,7 @@ export type ScanConfiguration = {
   triage_ignored_match_based_ids: string[];
   project_merge_base?: Sha1;
   fips_mode: boolean;
+  nosemgrep_disabled: boolean;
 }
 
 export type EngineConfiguration = {
@@ -649,6 +656,7 @@ export type EngineConfiguration = {
   transitive_reachability_enabled: boolean;
   ignored_files: string[];
   product_ignored_files?: ProductIgnoredFiles;
+  gradle_module_attribution: boolean;
   generic_slow_rollout: boolean;
   historical_config?: HistoricalConfiguration;
   always_suppress_errors: boolean;
@@ -713,6 +721,7 @@ export type ScanMetadata = {
   ecosystems: string[];
   packages: string[];
   enable_mal_deps?: boolean;
+  partial_scan_rule_ids?: RuleId[];
 }
 
 export type CiConfigFromRepo = {
@@ -763,6 +772,8 @@ export type CiScanResults = {
   rule_ids: RuleId[];
   contributions?: Contributions;
   dependencies?: CiScanDependencies;
+  skipped_subprojects?: SkippedSubproject[];
+  changed_dependency_sources?: Fpath[];
   metadata?: CiScanMetadata;
 }
 
@@ -802,7 +813,9 @@ export type CiScanComplete = {
   exit_code: number /*int*/;
   stats: CiScanCompleteStats;
   dependencies?: CiScanDependencies;
+  skipped_subprojects?: SkippedSubproject[];
   dependency_parser_errors?: DependencyParserError[];
+  changed_dependency_sources?: Fpath[];
   task_id?: string;
   final_attempt?: boolean;
 }
@@ -834,6 +847,11 @@ export type CiScanCompleteResponse = {
 }
 
 export type CiScanDependencies = Map<string, FoundDependency[]>
+
+export type SkippedSubproject = {
+  root_dir: Fpath;
+  dependency_sources: DependencySourceFile[];
+}
 
 export type DependencyParserError = {
   path: Fpath;
@@ -1073,6 +1091,7 @@ export type TargetingConf = {
   force_project_root?: ProjectRoot;
   force_novcs_project: boolean;
   exclude_minified_files: boolean;
+  include_binary_files: boolean;
   baseline_commit?: string;
 }
 
@@ -1146,6 +1165,13 @@ export type DumpRulePartitionsParams = {
   strategy?: string;
 }
 
+export type ScanParams = {
+  rules: Fpath;
+  targets: Fpath;
+  timeout: number;
+  timeout_threshold: number /*int*/;
+}
+
 export type LockfileKind =
 | { kind: 'PipRequirementsTxt' }
 | { kind: 'PoetryLock' }
@@ -1169,6 +1195,7 @@ export type LockfileKind =
 | { kind: 'MixLock' }
 | { kind: 'ConanLock' }
 | { kind: 'OpamLocked' }
+| { kind: 'MavenInstallJson' }
 
 export type ManifestKind =
 | { kind: 'RequirementsIn' }
@@ -1194,6 +1221,7 @@ export type ManifestKind =
 | { kind: 'Csproj' }
 | { kind: 'OpamFile' }
 | { kind: 'BuildSbt' }
+| { kind: 'ModuleBazel' }
 
 export type SbomKind =
 | { kind: 'CycloneDXJson' }
@@ -1227,9 +1255,15 @@ export type ResolutionErrorKind =
 | { kind: 'ResolutionCmdFailed'; value: ResolutionCmdFailed }
 | { kind: 'ParseDependenciesFailed'; value: string }
 | { kind: 'ScaParseError'; value: ScaParserName }
+| { kind: 'IncompleteDependencyResolution'; value: IncompleteDependencyResolution }
 | { kind: 'ResourceInaccessible'; value: ResourceInaccessible }
 
 export type ResolutionCmdFailed = {
+  command: string;
+  message: string;
+}
+
+export type IncompleteDependencyResolution = {
   command: string;
   message: string;
 }
@@ -1285,6 +1319,7 @@ export type ResolveDependenciesParams = {
   dependency_sources: DependencySource[];
   download_dependency_source_code: boolean;
   allow_local_builds: boolean;
+  gradle_module_attribution: boolean;
   package_manager_env?: [string, string][];
 }
 
@@ -1343,6 +1378,7 @@ export type FunctionCall =
 | { kind: 'CallFormatter'; value: [OutputFormat, FormatContext, CliOutput] }
 | { kind: 'CallSarifFormat'; value: [SarifFormat, FormatContext, CliOutput] }
 | { kind: 'CallValidate'; value: Fpath }
+| { kind: 'CallScan'; value: ScanParams }
 | { kind: 'CallResolveDependencies'; value: ResolveDependenciesParams }
 | { kind: 'CallUploadSymbolAnalysis'; value: [string, number /*int*/, SymbolAnalysis] }
 | { kind: 'CallDumpRulePartitions'; value: DumpRulePartitionsParams }
@@ -1360,6 +1396,7 @@ export type FunctionReturn =
 | { kind: 'RetFormatter'; value: string }
 | { kind: 'RetSarifFormat'; value: string }
 | { kind: 'RetValidate'; value: Option<CoreError> }
+| { kind: 'RetScan'; value: CoreOutput }
 | { kind: 'RetResolveDependencies'; value: [DependencySource, ResolutionResult][] }
 | { kind: 'RetUploadSymbolAnalysis'; value: string }
 | { kind: 'RetDumpRulePartitions'; value: boolean }
@@ -2198,6 +2235,7 @@ export function writeDependencyMatch(x: DependencyMatch, context: any = x): any 
     'dependency_pattern': _atd_write_required_field('DependencyMatch', 'dependency_pattern', writeScaPattern, x.dependency_pattern, x),
     'found_dependency': _atd_write_required_field('DependencyMatch', 'found_dependency', writeFoundDependency, x.found_dependency, x),
     'lockfile': _atd_write_required_field('DependencyMatch', 'lockfile', writeFpath, x.lockfile, x),
+    'dependency_paths': _atd_write_optional_field(_atd_write_array(writeDependencyPath), x.dependency_paths, x),
   };
 }
 
@@ -2206,6 +2244,7 @@ export function readDependencyMatch(x: any, context: any = x): DependencyMatch {
     dependency_pattern: _atd_read_required_field('DependencyMatch', 'dependency_pattern', readScaPattern, x['dependency_pattern'], x),
     found_dependency: _atd_read_required_field('DependencyMatch', 'found_dependency', readFoundDependency, x['found_dependency'], x),
     lockfile: _atd_read_required_field('DependencyMatch', 'lockfile', readFpath, x['lockfile'], x),
+    dependency_paths: _atd_read_optional_field(_atd_read_array(readDependencyPath), x['dependency_paths'], x),
   };
 }
 
@@ -2261,6 +2300,7 @@ export function writeDependencyChild(x: DependencyChild, context: any = x): any 
   return {
     'package': _atd_write_required_field('DependencyChild', 'package', _atd_write_string, x.package_, x),
     'version': _atd_write_required_field('DependencyChild', 'version', _atd_write_string, x.version, x),
+    'lockfile_path': _atd_write_optional_field(writeFpath, x.lockfile_path, x),
   };
 }
 
@@ -2268,6 +2308,19 @@ export function readDependencyChild(x: any, context: any = x): DependencyChild {
   return {
     package_: _atd_read_required_field('DependencyChild', 'package', _atd_read_string, x['package'], x),
     version: _atd_read_required_field('DependencyChild', 'version', _atd_read_string, x['version'], x),
+    lockfile_path: _atd_read_optional_field(readFpath, x['lockfile_path'], x),
+  };
+}
+
+export function writeDependencyPath(x: DependencyPath, context: any = x): any {
+  return {
+    'nodes': _atd_write_required_field('DependencyPath', 'nodes', _atd_write_array(writeDependencyChild), x.nodes, x),
+  };
+}
+
+export function readDependencyPath(x: any, context: any = x): DependencyPath {
+  return {
+    nodes: _atd_read_required_field('DependencyPath', 'nodes', _atd_read_array(readDependencyChild), x['nodes'], x),
   };
 }
 
@@ -3428,6 +3481,7 @@ export function writeScanConfiguration(x: ScanConfiguration, context: any = x): 
     'triage_ignored_match_based_ids': _atd_write_field_with_default(_atd_write_array(_atd_write_string), [], x.triage_ignored_match_based_ids, x),
     'project_merge_base': _atd_write_optional_field(writeSha1, x.project_merge_base, x),
     'fips_mode': _atd_write_field_with_default(_atd_write_bool, false, x.fips_mode, x),
+    'nosemgrep_disabled': _atd_write_field_with_default(_atd_write_bool, false, x.nosemgrep_disabled, x),
   };
 }
 
@@ -3438,6 +3492,7 @@ export function readScanConfiguration(x: any, context: any = x): ScanConfigurati
     triage_ignored_match_based_ids: _atd_read_field_with_default(_atd_read_array(_atd_read_string), [], x['triage_ignored_match_based_ids'], x),
     project_merge_base: _atd_read_optional_field(readSha1, x['project_merge_base'], x),
     fips_mode: _atd_read_field_with_default(_atd_read_bool, false, x['fips_mode'], x),
+    nosemgrep_disabled: _atd_read_field_with_default(_atd_read_bool, false, x['nosemgrep_disabled'], x),
   };
 }
 
@@ -3452,6 +3507,7 @@ export function writeEngineConfiguration(x: EngineConfiguration, context: any = 
     'transitive_reachability_enabled': _atd_write_field_with_default(_atd_write_bool, false, x.transitive_reachability_enabled, x),
     'ignored_files': _atd_write_field_with_default(_atd_write_array(_atd_write_string), [], x.ignored_files, x),
     'product_ignored_files': _atd_write_optional_field(writeProductIgnoredFiles, x.product_ignored_files, x),
+    'gradle_module_attribution': _atd_write_field_with_default(_atd_write_bool, false, x.gradle_module_attribution, x),
     'generic_slow_rollout': _atd_write_field_with_default(_atd_write_bool, false, x.generic_slow_rollout, x),
     'historical_config': _atd_write_optional_field(writeHistoricalConfiguration, x.historical_config, x),
     'always_suppress_errors': _atd_write_field_with_default(_atd_write_bool, false, x.always_suppress_errors, x),
@@ -3469,6 +3525,7 @@ export function readEngineConfiguration(x: any, context: any = x): EngineConfigu
     transitive_reachability_enabled: _atd_read_field_with_default(_atd_read_bool, false, x['transitive_reachability_enabled'], x),
     ignored_files: _atd_read_field_with_default(_atd_read_array(_atd_read_string), [], x['ignored_files'], x),
     product_ignored_files: _atd_read_optional_field(readProductIgnoredFiles, x['product_ignored_files'], x),
+    gradle_module_attribution: _atd_read_field_with_default(_atd_read_bool, false, x['gradle_module_attribution'], x),
     generic_slow_rollout: _atd_read_field_with_default(_atd_read_bool, false, x['generic_slow_rollout'], x),
     historical_config: _atd_read_optional_field(readHistoricalConfiguration, x['historical_config'], x),
     always_suppress_errors: _atd_read_field_with_default(_atd_read_bool, false, x['always_suppress_errors'], x),
@@ -3605,6 +3662,7 @@ export function writeScanMetadata(x: ScanMetadata, context: any = x): any {
     'ecosystems': _atd_write_field_with_default(_atd_write_array(_atd_write_string), [], x.ecosystems, x),
     'packages': _atd_write_field_with_default(_atd_write_array(_atd_write_string), [], x.packages, x),
     'enable_mal_deps': _atd_write_optional_field(_atd_write_bool, x.enable_mal_deps, x),
+    'partial_scan_rule_ids': _atd_write_optional_field(_atd_write_array(writeRuleId), x.partial_scan_rule_ids, x),
   };
 }
 
@@ -3618,6 +3676,7 @@ export function readScanMetadata(x: any, context: any = x): ScanMetadata {
     ecosystems: _atd_read_field_with_default(_atd_read_array(_atd_read_string), [], x['ecosystems'], x),
     packages: _atd_read_field_with_default(_atd_read_array(_atd_read_string), [], x['packages'], x),
     enable_mal_deps: _atd_read_optional_field(_atd_read_bool, x['enable_mal_deps'], x),
+    partial_scan_rule_ids: _atd_read_optional_field(_atd_read_array(readRuleId), x['partial_scan_rule_ids'], x),
   };
 }
 
@@ -3724,6 +3783,8 @@ export function writeCiScanResults(x: CiScanResults, context: any = x): any {
     'rule_ids': _atd_write_required_field('CiScanResults', 'rule_ids', _atd_write_array(writeRuleId), x.rule_ids, x),
     'contributions': _atd_write_optional_field(writeContributions, x.contributions, x),
     'dependencies': _atd_write_optional_field(writeCiScanDependencies, x.dependencies, x),
+    'skipped_subprojects': _atd_write_optional_field(_atd_write_array(writeSkippedSubproject), x.skipped_subprojects, x),
+    'changed_dependency_sources': _atd_write_optional_field(_atd_write_array(writeFpath), x.changed_dependency_sources, x),
     'metadata': _atd_write_optional_field(writeCiScanMetadata, x.metadata, x),
   };
 }
@@ -3739,6 +3800,8 @@ export function readCiScanResults(x: any, context: any = x): CiScanResults {
     rule_ids: _atd_read_required_field('CiScanResults', 'rule_ids', _atd_read_array(readRuleId), x['rule_ids'], x),
     contributions: _atd_read_optional_field(readContributions, x['contributions'], x),
     dependencies: _atd_read_optional_field(readCiScanDependencies, x['dependencies'], x),
+    skipped_subprojects: _atd_read_optional_field(_atd_read_array(readSkippedSubproject), x['skipped_subprojects'], x),
+    changed_dependency_sources: _atd_read_optional_field(_atd_read_array(readFpath), x['changed_dependency_sources'], x),
     metadata: _atd_read_optional_field(readCiScanMetadata, x['metadata'], x),
   };
 }
@@ -3836,7 +3899,9 @@ export function writeCiScanComplete(x: CiScanComplete, context: any = x): any {
     'exit_code': _atd_write_required_field('CiScanComplete', 'exit_code', _atd_write_int, x.exit_code, x),
     'stats': _atd_write_required_field('CiScanComplete', 'stats', writeCiScanCompleteStats, x.stats, x),
     'dependencies': _atd_write_optional_field(writeCiScanDependencies, x.dependencies, x),
+    'skipped_subprojects': _atd_write_optional_field(_atd_write_array(writeSkippedSubproject), x.skipped_subprojects, x),
     'dependency_parser_errors': _atd_write_optional_field(_atd_write_array(writeDependencyParserError), x.dependency_parser_errors, x),
+    'changed_dependency_sources': _atd_write_optional_field(_atd_write_array(writeFpath), x.changed_dependency_sources, x),
     'task_id': _atd_write_optional_field(_atd_write_string, x.task_id, x),
     'final_attempt': _atd_write_optional_field(_atd_write_bool, x.final_attempt, x),
   };
@@ -3847,7 +3912,9 @@ export function readCiScanComplete(x: any, context: any = x): CiScanComplete {
     exit_code: _atd_read_required_field('CiScanComplete', 'exit_code', _atd_read_int, x['exit_code'], x),
     stats: _atd_read_required_field('CiScanComplete', 'stats', readCiScanCompleteStats, x['stats'], x),
     dependencies: _atd_read_optional_field(readCiScanDependencies, x['dependencies'], x),
+    skipped_subprojects: _atd_read_optional_field(_atd_read_array(readSkippedSubproject), x['skipped_subprojects'], x),
     dependency_parser_errors: _atd_read_optional_field(_atd_read_array(readDependencyParserError), x['dependency_parser_errors'], x),
+    changed_dependency_sources: _atd_read_optional_field(_atd_read_array(readFpath), x['changed_dependency_sources'], x),
     task_id: _atd_read_optional_field(_atd_read_string, x['task_id'], x),
     final_attempt: _atd_read_optional_field(_atd_read_bool, x['final_attempt'], x),
   };
@@ -3923,6 +3990,20 @@ export function writeCiScanDependencies(x: CiScanDependencies, context: any = x)
 
 export function readCiScanDependencies(x: any, context: any = x): CiScanDependencies {
   return _atd_read_assoc_object_into_map(_atd_read_array(readFoundDependency))(x, context);
+}
+
+export function writeSkippedSubproject(x: SkippedSubproject, context: any = x): any {
+  return {
+    'root_dir': _atd_write_required_field('SkippedSubproject', 'root_dir', writeFpath, x.root_dir, x),
+    'dependency_sources': _atd_write_required_field('SkippedSubproject', 'dependency_sources', _atd_write_array(writeDependencySourceFile), x.dependency_sources, x),
+  };
+}
+
+export function readSkippedSubproject(x: any, context: any = x): SkippedSubproject {
+  return {
+    root_dir: _atd_read_required_field('SkippedSubproject', 'root_dir', readFpath, x['root_dir'], x),
+    dependency_sources: _atd_read_required_field('SkippedSubproject', 'dependency_sources', _atd_read_array(readDependencySourceFile), x['dependency_sources'], x),
+  };
 }
 
 export function writeDependencyParserError(x: DependencyParserError, context: any = x): any {
@@ -4579,6 +4660,7 @@ export function writeTargetingConf(x: TargetingConf, context: any = x): any {
     'force_project_root': _atd_write_optional_field(writeProjectRoot, x.force_project_root, x),
     'force_novcs_project': _atd_write_required_field('TargetingConf', 'force_novcs_project', _atd_write_bool, x.force_novcs_project, x),
     'exclude_minified_files': _atd_write_required_field('TargetingConf', 'exclude_minified_files', _atd_write_bool, x.exclude_minified_files, x),
+    'include_binary_files': _atd_write_field_with_default(_atd_write_bool, false, x.include_binary_files, x),
     'baseline_commit': _atd_write_optional_field(_atd_write_string, x.baseline_commit, x),
   };
 }
@@ -4597,6 +4679,7 @@ export function readTargetingConf(x: any, context: any = x): TargetingConf {
     force_project_root: _atd_read_optional_field(readProjectRoot, x['force_project_root'], x),
     force_novcs_project: _atd_read_required_field('TargetingConf', 'force_novcs_project', _atd_read_bool, x['force_novcs_project'], x),
     exclude_minified_files: _atd_read_required_field('TargetingConf', 'exclude_minified_files', _atd_read_bool, x['exclude_minified_files'], x),
+    include_binary_files: _atd_read_field_with_default(_atd_read_bool, false, x['include_binary_files'], x),
     baseline_commit: _atd_read_optional_field(_atd_read_string, x['baseline_commit'], x),
   };
 }
@@ -4834,6 +4917,24 @@ export function readDumpRulePartitionsParams(x: any, context: any = x): DumpRule
   };
 }
 
+export function writeScanParams(x: ScanParams, context: any = x): any {
+  return {
+    'rules': _atd_write_required_field('ScanParams', 'rules', writeFpath, x.rules, x),
+    'targets': _atd_write_required_field('ScanParams', 'targets', writeFpath, x.targets, x),
+    'timeout': _atd_write_required_field('ScanParams', 'timeout', _atd_write_float, x.timeout, x),
+    'timeout_threshold': _atd_write_required_field('ScanParams', 'timeout_threshold', _atd_write_int, x.timeout_threshold, x),
+  };
+}
+
+export function readScanParams(x: any, context: any = x): ScanParams {
+  return {
+    rules: _atd_read_required_field('ScanParams', 'rules', readFpath, x['rules'], x),
+    targets: _atd_read_required_field('ScanParams', 'targets', readFpath, x['targets'], x),
+    timeout: _atd_read_required_field('ScanParams', 'timeout', _atd_read_float, x['timeout'], x),
+    timeout_threshold: _atd_read_required_field('ScanParams', 'timeout_threshold', _atd_read_int, x['timeout_threshold'], x),
+  };
+}
+
 export function writeLockfileKind(x: LockfileKind, context: any = x): any {
   switch (x.kind) {
     case 'PipRequirementsTxt':
@@ -4880,6 +4981,8 @@ export function writeLockfileKind(x: LockfileKind, context: any = x): any {
       return 'ConanLock'
     case 'OpamLocked':
       return 'OpamLocked'
+    case 'MavenInstallJson':
+      return 'MavenInstallJson'
   }
 }
 
@@ -4929,6 +5032,8 @@ export function readLockfileKind(x: any, context: any = x): LockfileKind {
       return { kind: 'ConanLock' }
     case 'OpamLocked':
       return { kind: 'OpamLocked' }
+    case 'MavenInstallJson':
+      return { kind: 'MavenInstallJson' }
     default:
       _atd_bad_json('LockfileKind', x, context)
       throw new Error('impossible')
@@ -4983,6 +5088,8 @@ export function writeManifestKind(x: ManifestKind, context: any = x): any {
       return 'OpamFile'
     case 'BuildSbt':
       return 'BuildSbt'
+    case 'ModuleBazel':
+      return 'ModuleBazel'
   }
 }
 
@@ -5034,6 +5141,8 @@ export function readManifestKind(x: any, context: any = x): ManifestKind {
       return { kind: 'OpamFile' }
     case 'BuildSbt':
       return { kind: 'BuildSbt' }
+    case 'ModuleBazel':
+      return { kind: 'ModuleBazel' }
     default:
       _atd_bad_json('ManifestKind', x, context)
       throw new Error('impossible')
@@ -5147,6 +5256,8 @@ export function writeResolutionErrorKind(x: ResolutionErrorKind, context: any = 
       return ['ParseDependenciesFailed', _atd_write_string(x.value, x)]
     case 'ScaParseError':
       return ['ScaParseError', writeScaParserName(x.value, x)]
+    case 'IncompleteDependencyResolution':
+      return ['IncompleteDependencyResolution', writeIncompleteDependencyResolution(x.value, x)]
     case 'ResourceInaccessible':
       return ['ResourceInaccessible', writeResourceInaccessible(x.value, x)]
   }
@@ -5173,6 +5284,8 @@ export function readResolutionErrorKind(x: any, context: any = x): ResolutionErr
         return { kind: 'ParseDependenciesFailed', value: _atd_read_string(x[1], x) }
       case 'ScaParseError':
         return { kind: 'ScaParseError', value: readScaParserName(x[1], x) }
+      case 'IncompleteDependencyResolution':
+        return { kind: 'IncompleteDependencyResolution', value: readIncompleteDependencyResolution(x[1], x) }
       case 'ResourceInaccessible':
         return { kind: 'ResourceInaccessible', value: readResourceInaccessible(x[1], x) }
       default:
@@ -5193,6 +5306,20 @@ export function readResolutionCmdFailed(x: any, context: any = x): ResolutionCmd
   return {
     command: _atd_read_required_field('ResolutionCmdFailed', 'command', _atd_read_string, x['command'], x),
     message: _atd_read_required_field('ResolutionCmdFailed', 'message', _atd_read_string, x['message'], x),
+  };
+}
+
+export function writeIncompleteDependencyResolution(x: IncompleteDependencyResolution, context: any = x): any {
+  return {
+    'command': _atd_write_required_field('IncompleteDependencyResolution', 'command', _atd_write_string, x.command, x),
+    'message': _atd_write_required_field('IncompleteDependencyResolution', 'message', _atd_write_string, x.message, x),
+  };
+}
+
+export function readIncompleteDependencyResolution(x: any, context: any = x): IncompleteDependencyResolution {
+  return {
+    command: _atd_read_required_field('IncompleteDependencyResolution', 'command', _atd_read_string, x['command'], x),
+    message: _atd_read_required_field('IncompleteDependencyResolution', 'message', _atd_read_string, x['message'], x),
   };
 }
 
@@ -5354,6 +5481,7 @@ export function writeResolveDependenciesParams(x: ResolveDependenciesParams, con
     'dependency_sources': _atd_write_required_field('ResolveDependenciesParams', 'dependency_sources', _atd_write_array(writeDependencySource), x.dependency_sources, x),
     'download_dependency_source_code': _atd_write_required_field('ResolveDependenciesParams', 'download_dependency_source_code', _atd_write_bool, x.download_dependency_source_code, x),
     'allow_local_builds': _atd_write_required_field('ResolveDependenciesParams', 'allow_local_builds', _atd_write_bool, x.allow_local_builds, x),
+    'gradle_module_attribution': _atd_write_field_with_default(_atd_write_bool, false, x.gradle_module_attribution, x),
     'package_manager_env': _atd_write_optional_field(_atd_write_array(((x, context) => [_atd_write_string(x[0], x), _atd_write_string(x[1], x)])), x.package_manager_env, x),
   };
 }
@@ -5363,6 +5491,7 @@ export function readResolveDependenciesParams(x: any, context: any = x): Resolve
     dependency_sources: _atd_read_required_field('ResolveDependenciesParams', 'dependency_sources', _atd_read_array(readDependencySource), x['dependency_sources'], x),
     download_dependency_source_code: _atd_read_required_field('ResolveDependenciesParams', 'download_dependency_source_code', _atd_read_bool, x['download_dependency_source_code'], x),
     allow_local_builds: _atd_read_required_field('ResolveDependenciesParams', 'allow_local_builds', _atd_read_bool, x['allow_local_builds'], x),
+    gradle_module_attribution: _atd_read_field_with_default(_atd_read_bool, false, x['gradle_module_attribution'], x),
     package_manager_env: _atd_read_optional_field(_atd_read_array(((x, context): [string, string] => { _atd_check_json_tuple(2, x, context); return [_atd_read_string(x[0], x), _atd_read_string(x[1], x)] })), x['package_manager_env'], x),
   };
 }
@@ -5527,6 +5656,8 @@ export function writeFunctionCall(x: FunctionCall, context: any = x): any {
       return ['CallSarifFormat', ((x, context) => [writeSarifFormat(x[0], x), writeFormatContext(x[1], x), writeCliOutput(x[2], x)])(x.value, x)]
     case 'CallValidate':
       return ['CallValidate', writeFpath(x.value, x)]
+    case 'CallScan':
+      return ['CallScan', writeScanParams(x.value, x)]
     case 'CallResolveDependencies':
       return ['CallResolveDependencies', writeResolveDependenciesParams(x.value, x)]
     case 'CallUploadSymbolAnalysis':
@@ -5569,6 +5700,8 @@ export function readFunctionCall(x: any, context: any = x): FunctionCall {
         return { kind: 'CallSarifFormat', value: ((x, context): [SarifFormat, FormatContext, CliOutput] => { _atd_check_json_tuple(3, x, context); return [readSarifFormat(x[0], x), readFormatContext(x[1], x), readCliOutput(x[2], x)] })(x[1], x) }
       case 'CallValidate':
         return { kind: 'CallValidate', value: readFpath(x[1], x) }
+      case 'CallScan':
+        return { kind: 'CallScan', value: readScanParams(x[1], x) }
       case 'CallResolveDependencies':
         return { kind: 'CallResolveDependencies', value: readResolveDependenciesParams(x[1], x) }
       case 'CallUploadSymbolAnalysis':
@@ -5608,6 +5741,8 @@ export function writeFunctionReturn(x: FunctionReturn, context: any = x): any {
       return ['RetSarifFormat', _atd_write_string(x.value, x)]
     case 'RetValidate':
       return ['RetValidate', _atd_write_option(writeCoreError)(x.value, x)]
+    case 'RetScan':
+      return ['RetScan', writeCoreOutput(x.value, x)]
     case 'RetResolveDependencies':
       return ['RetResolveDependencies', _atd_write_array(((x, context) => [writeDependencySource(x[0], x), writeResolutionResult(x[1], x)]))(x.value, x)]
     case 'RetUploadSymbolAnalysis':
@@ -5644,6 +5779,8 @@ export function readFunctionReturn(x: any, context: any = x): FunctionReturn {
       return { kind: 'RetSarifFormat', value: _atd_read_string(x[1], x) }
     case 'RetValidate':
       return { kind: 'RetValidate', value: _atd_read_option(readCoreError)(x[1], x) }
+    case 'RetScan':
+      return { kind: 'RetScan', value: readCoreOutput(x[1], x) }
     case 'RetResolveDependencies':
       return { kind: 'RetResolveDependencies', value: _atd_read_array(((x, context): [DependencySource, ResolutionResult] => { _atd_check_json_tuple(2, x, context); return [readDependencySource(x[0], x), readResolutionResult(x[1], x)] }))(x[1], x) }
     case 'RetUploadSymbolAnalysis':
